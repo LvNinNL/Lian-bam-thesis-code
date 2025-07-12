@@ -1,0 +1,276 @@
+---
+title: "BAM Thesis - timeseries"
+author: "Lian van Nee"
+date: "2025-04-28"
+output: word_document
+---
+
+# Libraries
+
+```{r}
+library(here)
+library(tidyverse)
+library(lubridate)
+library(tsibble)
+library(readr)
+library(purrr)
+library(dplyr)
+library(tidyr)
+library(readxl)
+library(forecast)
+library(tseries)
+library(strucchange)
+library(ppcor)
+library(conflicted)
+library(zoo)
+library(prophet)
+library(Metrics)
+library(ggplot2)
+library(Matrix)
+library(xgboost)
+library(writexl)
+
+
+options(contrasts = c("contr.treatment", "contr.treatment"))
+conflict_prefer("select", "dplyr")
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::lag)
+```
+
+# General statistics Order Data
+
+```{r}
+"Importing Glims data"
+# Data Loading I have split it up in smaller parts so that it can be uploaded to GIT
+# List all the chunks
+chunk_files <- list.files(
+  path = here("Data", "Order_data"),
+  pattern = "data_chunk_.*\\.csv",
+  full.names = TRUE
+)
+# Load and combine the chunks back into one dataset
+data <- do.call(rbind, lapply(chunk_files, read.csv))
+# Remove empty rows
+data <- data[rowSums(is.na(data)) != ncol(data), ]
+
+# We start with 4577229 observations
+
+"Making adjustments to data"
+# Changing dates to data format
+data$datum_creatie <- as.Date(data$datum_creatie, format = "%d/%m/%Y")
+data$datum_afname <- as.Date(data$datum_afname, format = "%d/%m/%Y")
+
+# Changing Cito to binary variable
+data <- data %>%
+  mutate(Cito = if_else(Cito_JN == "Cito", 1, 0)) %>% 
+  select(-Cito_JN, -peildatum)
+
+"Adding variables"
+
+# Adding testing variable
+data <- data %>%
+  mutate(self_testing = ifelse(str_detect(afname_locatie, "^[0-9]"), 1, 0))
+
+"Deleting huisbezoek, selftesting and DOA data"
+# Total orders = 4577229
+# Huisbezoek = 356927
+# Selftesting = 274604
+# Cito = 163252
+# Clean = 3782446
+
+# Getting the clean dataset
+data_clean <- data %>%
+  filter((data$huisbezoek != 1 | is.na(data$huisbezoek)) &
+  (data$self_testing != 1 | is.na(data$self_testing)) &
+  (data$Cito != 1 | is.na(data$Cito)))
+```
+
+```{r data on percentages of home/self/cito tests}
+count_huisbezoek <- sum(data$huisbezoek == 1, na.rm = TRUE)
+count_self_testing <- sum(data$self_testing == 1, na.rm = TRUE)
+count_cito_only <- sum(
+  data$Cito == 1 &
+  (data$huisbezoek != 1 | is.na(data$huisbezoek)) &
+  (data$self_testing != 1 | is.na(data$self_testing)),
+  na.rm = TRUE
+)
+
+total_orders <- nrow(data)
+count_none <- sum(
+  (data$huisbezoek != 1 | is.na(data$huisbezoek)) &
+  (data$self_testing != 1 | is.na(data$self_testing)) &
+  (data$Cito != 1 | is.na(data$Cito))
+)
+
+perc_huisbezoek <- (count_huisbezoek / total_orders) * 100
+perc_self_testing <- (count_self_testing / total_orders) * 100
+perc_cito_only <- (count_cito_only / total_orders) * 100
+perc_none <- (count_none / total_orders) * 100
+
+cat("Huisbezoek: ", count_huisbezoek, " (", round(perc_huisbezoek, 2), "%)\n", sep = "")
+cat("Self-testing: ", count_self_testing, " (", round(perc_self_testing, 2), "%)\n", sep = "")
+cat("Cito (not huisbezoek, not self-testing): ", count_cito_only, " (", round(perc_cito_only, 2), "%)\n", sep = "")
+cat("None of these: ", count_none, " (", round(perc_none, 2), "%)\n", sep = "")
+
+"Data cleaned"
+data_clean <- data %>%
+  filter((data$huisbezoek != 1 | is.na(data$huisbezoek)) &
+  (data$self_testing != 1 | is.na(data$self_testing)) &
+  (data$Cito != 1 | is.na(data$Cito)))
+```
+## Referring Agent Statistics
+```{r}
+colnames(data)
+
+data_from_service_area <- data %>% 
+  filter(!is.na(BD_regio)) 
+
+# Number of postcodes Atalmedial sees as service area
+length(unique(data_from_service_area$postcode_patient))
+
+# Percentages of order segment
+summary_table <- data_clean %>%
+  group_by(segment) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  mutate(percentage = (count / sum(count)) * 100)
+
+# View the table
+print(summary_table)
+```
+
+# Kennemerland
+
+```{r}
+# Getting all Kennemerland Postal Codes
+kennemerland_postalcodes <- data %>% 
+  filter(BD_regio %in% c("Kennemerland Zuid", "Kennemerland Noord", "Hoofddorp")) %>% 
+  distinct(postcode_patient) %>% 
+  mutate(PC4 = as.character(postcode_patient)) %>%
+  select(-postcode_patient)
+
+# creating data_clean for Kennemerland
+ken_data_clean <- data_clean %>% 
+  filter(postcode_patient %in% kennemerland_postalcodes$PC4) %>%
+  filter(!datum_creatie=="2025-04-25") # Delete 2025-04-25, as this day was not fully recorded
+```
+
+## Visualization order per PC
+
+```{r}
+# Aggregating on PC
+orders_per_postcode <- ken_data_clean %>%
+  group_by(postcode_patient) %>%
+  summarise(total_orders = n()) %>%
+  rename(PC4 = postcode_patient)
+
+readr::write_csv(orders_per_postcode, here::here("Data", "count_num_orders_per_postcode.csv"))
+```
+
+# Statistics on Locations
+
+```{r importing data set}
+availability_locations <- read_excel(here("Data", "RAW_Company", "beschikbaarheid_priklocaties_20250425.xlsx"))
+
+"Number of Distinct locations"
+# Remove all information on different rooms etc. per location
+availability_locations <- availability_locations %>% 
+  mutate(
+    Name = sub(":.*", "", Name)
+  )
+
+length(unique(availability_locations$Name))
+
+"Dataset for visualizaiton"
+locations_geo_info <- availability_locations %>% 
+  distinct(Name, Latitude, Longitude)
+
+write_xlsx(locations_geo_info, here("Data", "Visualization", "locations_geo_info.xlsx"))
+readr::write_csv(locations_geo_info, here::here("Data", "Visualization", "locations_geo_info.csv"))
+```
+
+
+## Type of tests
+
+```{r}
+geplande_afspraken_CareWare <- read_excel(here("Data", "RAW_Company","geplande_afspraken_CareWare.xlsx"))
+View(geplande_afspraken_CareWare)
+
+unique(geplande_afspraken_CareWare$naam_afspraak)
+```
+
+# Time between Order time and Appointment. 
+
+```{r}
+# Filter only orders with a location
+ken_data_clean_completed <- ken_data_clean %>%
+  filter(!is.na(afname_locatie)) %>%
+  mutate(days_between = as.numeric(datum_afname - datum_creatie)) %>% 
+  filter(days_between >= 0)
+
+# Step 2: Inspect basic summary
+summary(ken_data_clean_completed$days_between)
+
+# Step 3: Plot the distribution
+ken_data_clean_completed %>%
+  filter(days_between >= 0, days_between <= 50) %>%
+  ggplot(aes(x = days_between)) +
+  geom_histogram(binwidth = 1, color = "black", fill = "lightblue") +
+  labs(title = "Distribution of Days Between Creation and Collection (0–500 Days)",
+       x = "Number of Days",
+       y = "Frequency") +
+  theme_minimal()
+
+# Calculate percentage per number of days
+percentage_per_day <- ken_data_clean_completed %>%
+  group_by(days_between) %>%
+  summarise(n = n()) %>%
+  mutate(percentage = 100 * n / sum(n)) %>%
+  arrange(days_between)
+
+
+# Adjusted for 14+ days
+percentage_per_day <- ken_data_clean_completed %>%
+  mutate(day_group = ifelse(days_between <= 30, as.character(days_between), "31+")) %>%
+  group_by(day_group) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  mutate(percentage = round(100 * n / sum(n), 2)) %>%
+  mutate(day_group_order = ifelse(day_group == "31+", 999, as.numeric(day_group))) %>%
+  arrange(day_group_order) %>%
+  select(-day_group_order)
+
+# Plotting
+
+
+# Step 1: Create your plot and assign it to an object
+plot_days <- ggplot(percentage_per_day, aes(x = day_group, y = percentage)) +
+  geom_col(fill = "steelblue") +
+  labs(
+    title = "Percentage of Orders by Days Between Creation and Collection",
+    x = "Days Between Creation and Collection",
+    y = "Percentage (%)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Step 2: Save the plot
+ggsave(here("figures", "percentage_by_days_between.png"), plot = plot_days, width = 10, height = 6, dpi = 300)
+```
+## Per day of the week
+
+```{r}
+# Step 1: Add day of week
+ken_data_clean_completed <- ken_data_clean_completed %>%
+  mutate(weekday = wday(datum_creatie, label = TRUE, abbr = FALSE))  # e.g., "Monday", "Tuesday", ...
+
+# Step 2: Count total orders and same-day completions per weekday
+same_day_pct_by_weekday <- ken_data_clean_completed %>%
+  group_by(weekday) %>%
+  summarise(
+    total_orders = n(),
+    same_day_orders = sum(days_between == 0),
+    percentage_same_day = 100 * same_day_orders / total_orders
+  ) %>%
+  arrange(match(weekday, c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")))
+
+```
+

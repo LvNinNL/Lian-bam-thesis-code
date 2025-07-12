@@ -1,0 +1,1159 @@
+---
+title: "BAM Thesis - Forecasting: Variable Selection"
+author: "Lian van Nee"
+date: "2025-04-28"
+output: word_document
+---
+
+# Libraries
+
+```{r}
+library(here)
+library(tidyverse)
+library(lubridate)
+library(tsibble)
+library(stringr)
+library(readr)
+library(purrr)
+library(dplyr)
+library(tidyr)
+library(readxl)
+library(forecast)
+library(tseries)
+library(strucchange)
+library(ppcor)
+library(conflicted)
+library(zoo)
+library(prophet)
+library(Metrics)
+library(ggplot2)
+library(Matrix)
+library(xgboost)
+library(broom)
+library(xgboost)
+library(data.table)
+
+
+options(contrasts = c("contr.treatment", "contr.treatment"))
+conflict_prefer("select", "dplyr")
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::lag)
+```
+
+## Importing data
+
+```{r}
+# Importing Order dataset
+ken_daily_orders <- read.csv(here("Data","ken_daily_orders_variables.csv"))
+
+colnames(ken_daily_orders)
+```
+
+“The models were estimated using ARIMA processes, with orders selected automatically via the auto.arima function (Hyndman et al., 2021). This function selects the ARIMA(p,d,q)(P,D,Q)s model that minimizes the corrected Akaike Information Criterion (AICc), balancing model fit and complexity. Automatic selection ensures an objective and reproducible model specification. Residual diagnostics were checked to confirm the adequacy of the selected models.”
+
+> *“Model selection was based on AIC, which is commonly recommended for forecasting tasks because it prioritizes predictive accuracy while balancing model complexity. BIC, which applies a stronger penalty for complexity, was considered but not used as the primary criterion, as the objective was to minimize forecast error rather than identify the true underlying model structure.”*
+
+> *“The ACF and PACF of the residuals show no significant autocorrelation remaining, and no clear seasonal patterns (e.g. weekly spikes). This supports the model selection outcome, where no seasonal ARIMA terms (P,D,Q) were chosen. The residuals resemble white noise, indicating the model captured the structure well.”*
+
+> *“Rolling averages of the past 7 days were not added as external regressors, as the ARIMA model’s autoregressive terms inherently capture the relationship between current and past values. Adding a rolling average, which is a function of past values, would risk introducing multicollinearity without clear benefit.”*
+
+*“The ARIMA + xreg model relies on externally supplied calendar indicators (e.g. holidays). The model does not predict holiday occurrence but applies adjustments based on provided future holiday schedules. This allows forecast accuracy to benefit from known calendar effects without relying on the model to infer holiday timing.”*
+
+# ARIMA
+
+## Preparation
+
+```{r}
+# Importing data again
+ken_daily_orders <- read.csv(here("Data","ken_daily_orders_variables.csv"))
+
+ken_daily_orders <- ken_daily_orders %>%
+  mutate(datum_creatie = as.Date(datum_creatie),
+         post_break_dummy = ifelse(row_number() >= 463, 1, 0))
+
+# Training data: Get first 90% of rows
+n <- nrow(ken_daily_orders)
+training_data <- ken_daily_orders %>% dplyr::slice(1:floor(0.9 * n))
+training_data$month_factor <- factor(format(training_data$datum_creatie, "%m"), levels = sprintf("%02d", 1:12))
+
+test_data <- ken_daily_orders %>% dplyr::slice(1:floor(0.9 * n))
+
+
+```
+
+## Evaluation Formula
+
+```{r}
+evaluate_arima_expanding <- function(data, horizon = 14, stride = 7, initial_train_frac = 0.8, tuning_grid) {
+  n <- nrow(data)
+  initial_train_end <- floor(initial_train_frac * n)
+
+  metrics_list <- list()
+  predictions_list <- list()
+  modelspecs_list <- list()
+
+  for (i in 1:nrow(tuning_grid)) {
+    xreg_formula <- as.formula(tuning_grid$formula[i])
+    end_train <- initial_train_end
+
+    wmapes <- c()
+    wmpes <- c()
+    rmses <- c()
+    preds_df <- data.frame()
+    model_specs <- list()
+
+    while ((end_train + horizon) <= n) {
+      train_data <- data[1:end_train, ]
+      test_data <- data[(end_train + 1):(end_train + horizon), ]
+
+      train_y <- train_data$log_order_count
+      actual_test <- exp(test_data$log_order_count) - 1
+      dates <- test_data$datum_creatie
+
+      train_y_ts <- ts(train_y, frequency = 7)
+
+      # Check if any variables are in the formula (i.e. not "~ 1")
+      if (length(all.vars(xreg_formula)) > 0) {
+        train_xreg <- model.matrix(xreg_formula, data = train_data)[, -1, drop = FALSE]
+        test_xreg <- model.matrix(xreg_formula, data = test_data)[, -1, drop = FALSE]
+
+        model <- auto.arima(train_y_ts, xreg = train_xreg, seasonal = TRUE)
+        fc <- forecast(model, xreg = test_xreg, h = horizon)
+      } else {
+        model <- auto.arima(train_y_ts, seasonal = TRUE)
+        fc <- forecast(model, h = horizon)
+      }
+
+      # Store model spec
+      ord <- arimaorder(model)
+      seasonal_part <- if (length(ord) >= 6) ord[4:6] else c(0, 0, 0)
+      seasonal_period <- frequency(train_y_ts)
+
+      model_specs[[length(model_specs) + 1]] <- list(
+        order = ord[1:3],
+        seasonal = seasonal_part,
+        period = seasonal_period,
+        aicc = model$aicc
+      )
+
+      pred <- exp(fc$mean) - 1
+      preds_df <- bind_rows(preds_df, data.frame(date = dates, actual = actual_test, predicted = pred))
+
+      wmapes <- c(wmapes, sum(abs(actual_test - pred)) / sum(actual_test) * 100)
+      wmpes <- c(wmpes, sum(actual_test - pred) / sum(actual_test) * 100)
+      rmses <- c(rmses, sqrt(mean((actual_test - pred)^2)))
+
+      end_train <- end_train + stride
+    }
+
+    # Save metrics row
+    metrics_list[[i]] <- data.frame(
+      formula = as.character(xreg_formula)[2],
+      wMAPE_mean = mean(wmapes),
+      wMPE_mean = mean(wmpes),
+      RMSE_mean = mean(rmses)
+    )
+
+    # Name for predictions/models
+    pred_name <- paste0("formula_", i, "_", gsub(" ", "", as.character(xreg_formula)[2]))
+
+    predictions_list[[pred_name]] <- preds_df
+
+    # Format and save model specs
+    model_specs_df <- do.call(rbind, lapply(model_specs, function(x) {
+      data.frame(
+        p = x$order[1],
+        d = x$order[2],
+        q = x$order[3],
+        P = x$seasonal[1],
+        D = x$seasonal[2],
+        Q = x$seasonal[3],
+        period = x$period,
+        AICc = x$aicc
+      )
+    }))
+    modelspecs_list[[pred_name]] <- model_specs_df
+  }
+
+  metrics_df <- bind_rows(metrics_list)
+  return(list(
+    metrics = metrics_df,
+    predictions = predictions_list,
+    modelspecs = modelspecs_list
+  ))
+}
+```
+
+## Tuning Model
+
+```{r}
+arima_tuning_grid <- data.frame(
+  formula = c("~ 1",  # means: no regressors
+            "~ is_SchoolHoliday",
+            "~ is_PublicHoliday",
+            "~ is_SchoolHoliday + is_PublicHoliday",
+            "~ is_SchoolHoliday + is_PublicHoliday + is_rebound_day",
+            "~ is_SchoolHoliday + is_PublicHoliday + trend_post_break",
+            "~ is_SchoolHoliday + is_PublicHoliday + month_factor")
+)
+
+arima_tuning_results <- evaluate_arima_expanding(data = training_data, horizon = 14, stride = 7, initial_train_frac = 0.8, tuning_grid = arima_tuning_grid)
+
+saveRDS(arima_tuning_results, 
+        file = here("results", "arima_tuning_results.rds"))
+
+arima_tuning_results <- readRDS(here("results", "arima_tuning_results.rds"))
+
+arima_tuning_results_metrics <- arima_tuning_results$metrics
+
+# Model specs of best performing model: both Holiays + trend
+arima_tuning_best_model_specs <- arima_tuning_results$modelspecs[[6]]
+
+write.csv(arima_tuning_best_model_specs, file = here("results", "arima", "arima_tuning_best_model_specs.csv"), row.names = FALSE)
+
+print(arima_tuning_results_metrics)
+
+# write.csv(arima_tuning_results_metrics, file = here("Results", "arima_tuning_results_metrics.csv"), row.names = FALSE)
+```
+
+```{r}
+arima_tuning_grid2 <- data.frame(
+  formula = c(
+            "~ is_SchoolHoliday + is_PublicHoliday + is_rebound_day + trend_post_break",
+            "~ is_SchoolHoliday + is_PublicHoliday + trend_post_break + month_factor",
+            "~ is_SchoolHoliday + is_PublicHoliday + month_factor + is_rebound_day",
+            "~ is_SchoolHoliday + is_PublicHoliday + is_rebound_day + trend_post_break + month_factor")
+)
+
+arima_tuning_results2 <- evaluate_arima_expanding(data = training_data, horizon = 14, stride = 7, initial_train_frac = 0.8, tuning_grid = arima_tuning_grid2)
+
+saveRDS(arima_tuning_results2, 
+        file = here("results", "arima_tuning_results2.rds"))
+
+arima_tuning_results2 <- readRDS(here("results", "arima_tuning_results2.rds"))
+
+arima_tuning_results_metrics2 <- arima_tuning_results2$metrics
+
+print(arima_tuning_results_metrics2)
+
+#write.csv(arima_tuning_results_metrics2, file = here("Results", "arima_tuning_results_metrics2.csv"), row.names = FALSE)
+```
+
+## Final Test
+
+```{r}
+evaluate_arima_expanding_final <- function(data, horizon = 14, stride = 7, initial_train_frac = 0.8, tuning_grid) {
+  n <- nrow(data)
+  initial_train_end <- floor(initial_train_frac * n)
+
+  metrics_list <- list()
+  predictions_list <- list()
+  modelspecs_list <- list()
+
+  for (i in 1:nrow(tuning_grid)) {
+    xreg_formula <- as.formula(tuning_grid$formula[i])
+    end_train <- initial_train_end
+
+    wmapes <- c()
+    wmpes <- c()
+    rmses <- c()
+    preds_df <- data.frame()
+    model_specs <- list()
+
+    while ((end_train + horizon) <= n) {
+      train_data <- data[1:end_train, ]
+      test_data <- data[(end_train + 1):(end_train + horizon), ]
+
+      train_y <- train_data$log_order_count
+      actual_test <- exp(test_data$log_order_count) - 1
+      dates <- test_data$datum_creatie
+
+      train_y_ts <- ts(train_y, frequency = 7)
+
+      if (length(all.vars(xreg_formula)) > 0) {
+        train_xreg <- model.matrix(xreg_formula, data = train_data)[, -1, drop = FALSE]
+        test_xreg <- model.matrix(xreg_formula, data = test_data)[, -1, drop = FALSE]
+
+        model <- Arima(
+          train_y_ts,
+          order = c(0, 0, 3),
+          seasonal = list(order = c(0, 1, 1), period = 7),
+          xreg = train_xreg
+        )
+
+        fc <- forecast(model, xreg = test_xreg, h = horizon)
+      } else {
+        model <- Arima(
+          train_y_ts,
+          order = c(0, 0, 3),
+          seasonal = list(order = c(0, 1, 1), period = 7)
+        )
+
+        fc <- forecast(model, h = horizon)
+      }
+
+      ord <- arimaorder(model)
+      seasonal_part <- if (length(ord) >= 6) ord[4:6] else c(0, 0, 0)
+      seasonal_period <- frequency(train_y_ts)
+
+      model_specs[[length(model_specs) + 1]] <- list(
+        order = ord[1:3],
+        seasonal = seasonal_part,
+        period = seasonal_period,
+        aicc = model$aicc
+      )
+
+      pred <- exp(fc$mean) - 1
+      preds_df <- bind_rows(preds_df, data.frame(date = dates, actual = actual_test, predicted = pred))
+
+      wmapes <- c(wmapes, sum(abs(actual_test - pred)) / sum(actual_test) * 100)
+      wmpes <- c(wmpes, sum(actual_test - pred) / sum(actual_test) * 100)
+      rmses <- c(rmses, sqrt(mean((actual_test - pred)^2)))
+
+      end_train <- end_train + stride
+    }
+
+    # Save metrics row
+    metrics_list[[i]] <- data.frame(
+      formula = as.character(xreg_formula)[2],
+      wMAPE_mean = mean(wmapes),
+      wMPE_mean = mean(wmpes),
+      RMSE_mean = mean(rmses)
+    )
+
+    pred_name <- paste0("formula_", i, "_", gsub(" ", "", as.character(xreg_formula)[2]))
+
+    predictions_list[[pred_name]] <- preds_df
+
+    model_specs_df <- do.call(rbind, lapply(model_specs, function(x) {
+      data.frame(
+        p = x$order[1],
+        d = x$order[2],
+        q = x$order[3],
+        P = x$seasonal[1],
+        D = x$seasonal[2],
+        Q = x$seasonal[3],
+        period = x$period,
+        AICc = x$aicc
+      )
+    }))
+    modelspecs_list[[pred_name]] <- model_specs_df
+  }
+
+  metrics_df <- bind_rows(metrics_list)
+  return(list(
+    metrics = metrics_df,
+    predictions = predictions_list,
+    modelspecs = modelspecs_list
+  ))
+}
+```
+
+```{r}
+arima_final_tuning_grid <- data.frame(
+  formula = c("~ is_SchoolHoliday + is_PublicHoliday + trend_post_break")
+)
+
+arima_final_results <- evaluate_arima_expanding_final(data = ken_daily_orders, horizon = 14, stride = 14, initial_train_frac = 0.9, tuning_grid = arima_final_tuning_grid)
+
+saveRDS(arima_final_results, 
+        file = here("results", "arima_final_results.rds"))
+
+arima_final_results <- readRDS(here("results", "arima_final_results.rds"))
+
+arima_final_metrics <- arima_final_results$metrics
+arima_final_predictions <- arima_final_results$predictions[[1]]
+
+print(arima_final_metrics)
+print(arima_final_predictions)
+```
+### Visualization
+
+```{r arima_visualizing}
+p <-  ggplot(arima_final_predictions, aes(x = date)) +
+  geom_line(aes(y = actual), color = "black", size = 1, linetype = "solid") +
+  geom_line(aes(y = predicted), color = "blue", size = 1, linetype = "dashed") +
+  labs(
+    title = "Actual vs Predicted Order Counts (ARIMA)",
+    x = "Date",
+    y = "Order Count",
+    caption = "Black = Actual, Blue Dashed = Predicted"
+  ) +
+  theme_minimal()
+
+ggsave(
+  filename = here::here("results", "arima", "arima_pred_vs_actual.png"),
+  plot = p,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+```
+
+### Residuals
+
+```{r}
+# Create residuals
+arima_final_predictions <- arima_final_predictions %>%
+  mutate(
+    residual = actual - predicted,
+    day_of_week = weekdays(date)
+  )
+
+# 1. Residuals over time
+p1 <- ggplot(arima_final_predictions, aes(x = date, y = residual)) +
+  geom_line(color = "darkred") +
+  labs(title = "ARIMA Residuals Over Time", x = "Date", y = "Residual") +
+  theme_minimal()
+
+ggsave(filename = here("results", "arima", "residuals_over_time.png"), plot = p1, width = 8, height = 4)
+
+# 2. ACF plot of residuals
+resid <- as.numeric(na.omit(arima_final_predictions$residual))
+p2 <- ggAcf(resid, lag.max = 20) +
+  ggtitle("ACF of ARIMA Residuals")
+
+ggsave(filename = here("results", "arima", "acf_residuals.png"), plot = p2, width = 6, height = 4)
+
+# 3. Residuals by day of the week
+p3 <- ggplot(arima_final_predictions, aes(x = day_of_week, y = residual)) +
+  geom_boxplot(fill = "lightblue") +
+  labs(title = "Residuals by Day of the Week", x = "Day", y = "Residual") +
+  theme_minimal()
+
+ggsave(filename = here("results", "arima", "residuals_by_weekday.png"), plot = p3, width = 6, height = 4)
+
+# 4. Predicted vs Actual
+p4 <- ggplot(arima_final_predictions, aes(x = actual, y = predicted)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Predicted vs Actual", x = "Actual", y = "Predicted") +
+  theme_minimal()
+
+ggsave(filename = here("results", "arima", "predicted_vs_actual.png"), plot = p4, width = 6, height = 4)
+
+p1
+p2
+p3
+p4
+```
+
+# Prophet Model
+
+Prophet does not handle lags natively. So need to be computed.
+
+We will not add lags, because seasonality will capture this
+
+The Prophet model was tuned by varying the trend, seasonality, and regressor prior scales to balance model flexibility and overfitting. An expanding window cross-validation was applied to evaluate combinations of these parameters, reflecting practical forecasting conditions. Known structural breaks were handled both by specifying changepoint dates and by including trend_post_break as an external regressor.
+
+## Preparation
+
+```{r preparation}
+library(prophet)
+library(dplyr)
+library(Metrics)
+
+# Ensure day_of_week is a factor
+ken_daily_orders$day_of_week <- as.factor(ken_daily_orders$day_of_week)
+
+# Create dummies ONCE and drop Mon as reference
+all_dummies <- model.matrix(~ day_of_week - 1, data = ken_daily_orders)
+all_dummies <- all_dummies[, !colnames(all_dummies) %in% "day_of_weekMon", drop = FALSE]
+
+# Bind to data
+ken_daily_orders <- cbind(ken_daily_orders, all_dummies)
+
+# Rename for Prophet
+ken_daily_orders <- ken_daily_orders %>%
+  rename(ds = datum_creatie, y = log_order_count)
+
+# Training data: Get first 90% of rows
+n <- nrow(ken_daily_orders)
+training_data <- ken_daily_orders %>% dplyr::slice(1:floor(0.9 * n))
+
+"Adding Holidays so it can be integrated into prophet model"
+all_holidays <- read_excel(here("Data", "External_Variables", "all_holidays.xlsx"))
+
+my_holidays <- all_holidays %>%
+  mutate(
+    ds = as.Date(date),
+    lower_window = 0,
+    upper_window = 0,
+    holiday = holiday_name
+  ) %>%
+  select(holiday, ds, lower_window, upper_window)
+
+```
+
+## Evaluation Function
+
+```{r actual}
+evaluate_prophet_expanding <- function(data, horizon = 14, stride = 7, initial_train_frac = 0.8, tuning_grid) {
+  n <- nrow(data)
+  initial_train_end <- floor(initial_train_frac * n)
+
+  metrics_list <- list()
+  predictions_list <- list()
+
+  for (i in 1:nrow(tuning_grid)) {
+    params <- tuning_grid[i, ]
+    end_train <- initial_train_end
+
+    wmapes <- c()
+    wmpes <- c()
+    rmses <- c()
+    preds_df <- data.frame()
+
+    while ((end_train + horizon) <= n) {
+      train_data <- data[1:end_train, ]
+      test_data <- data[(end_train + 1):(end_train + horizon), ]
+
+      # Prophet model
+      m <- prophet(
+        changepoints = as.Date(c("2023-04-08")),
+        changepoint.prior.scale = params$changepoint_prior_scale,
+        seasonality.prior.scale = params$seasonality_prior_scale,
+        holidays = my_holidays,
+        holidays.prior.scale = params$holidays_prior_scale,
+        yearly.seasonality = TRUE,
+        weekly.seasonality = TRUE,
+        daily.seasonality = FALSE
+      )
+
+      # Fit model
+      m <- fit.prophet(m, train_data)
+
+      # Predict
+      future <- test_data[, c("ds", "trend_post_break")]
+      fc <- predict(m, future)
+      pred <- exp(fc$yhat) - 1
+      actual <- test_data$order_count
+      dates <- test_data$ds
+
+      # Save predictions
+      preds_df <- bind_rows(preds_df, data.frame(date = dates, actual = actual, predicted = pred))
+
+      # Metrics
+      wmapes <- c(wmapes, sum(abs(actual - pred)) / sum(actual) * 100)
+      wmpes <- c(wmpes, sum(actual - pred) / sum(actual) * 100)
+      rmses <- c(rmses, rmse(actual, pred))
+
+      end_train <- end_train + stride
+    }
+
+    # Save metrics row
+    metrics_list[[i]] <- data.frame(
+      changepoint_prior_scale = params$changepoint_prior_scale,
+      seasonality_prior_scale = params$seasonality_prior_scale,
+      holidays_prior_scale = params$holidays_prior_scale,
+      wMAPE_mean = mean(wmapes),
+      wMPE_mean = mean(wmpes),
+      RMSE_mean = mean(rmses)
+    )
+
+    # Name for predictions
+    pred_name <- paste0(
+      "cps=", params$changepoint_prior_scale,
+      "sps=", params$seasonality_prior_scale,
+      "hps=", params$holidays_prior_scale
+    )
+    predictions_list[[pred_name]] <- preds_df
+  }
+
+  metrics_df <- bind_rows(metrics_list)
+  return(list(metrics = metrics_df, predictions = predictions_list))
+}
+```
+
+## Tuning Model
+
+saveRDS(prophet_tuning_results,
+
+file = here("results", "prophet_tuning_results.rds"))
+
+```{r}
+# Tuning grid
+prophet_tuning_grid <- expand.grid(
+  changepoint_prior_scale = c(0.001, 0.005, 0.01, 0.05),
+  seasonality_prior_scale = c(1, 5, 10),
+  holidays_prior_scale = c(1, 5, 10)
+)
+
+# Run evaluation
+prophet_tuning_results <- evaluate_prophet_expanding(training_data, horizon = 14, initial_train_frac = 0.8, stride = 7, tuning_grid = prophet_tuning_grid)
+
+saveRDS(prophet_tuning_results, 
+        file = here("results", "prophet_tuning_results.rds"))
+
+prophet_tuning_results_metrics <- prophet_tuning_results$metrics %>%  
+  dplyr::arrange(wMAPE_mean)
+print(prophet_tuning_results_metrics)
+
+# Saving metrics
+write.csv(prophet_tuning_results_metrics, 
+          file = here("Results", "prophet_tuning_results_metrics.csv"), 
+          row.names = FALSE)
+```
+
+Best parameter tuning combination is 0.001, the combination of seasonality and holidaysonly cahnge ffects on the thrid or fourth decimal place. Seasonality and holiday priords thus don't menaingfully seem to improve the performance.
+
+changepoint_prior_scale = 0.001, seasonality_prior_scale = 10, holidays_prior_scale = 10
+
+> *The tuning grid search indicated that a changepoint prior scale of 0.01, seasonality prior scale of 10, and holidays prior scale of 10 provided the most accurate forecasts, as measured by weighted MAPE (7.27%) and RMSE (125.0). This configuration was therefore selected as the final tuning paramaeters model for subsequent forecasting.*
+
+In Prophet, prior scale parameters control the flexibility of different model components. The changepoint.prior.scale determines how much the trend is allowed to change at specified or automatically detected changepoints; smaller values produce smoother trends, while larger values allow sharp changes. The seasonality.prior.scale governs the adaptability of the seasonal component, where higher values permit more complex seasonal patterns. The holidays.prior.scale controls how much the model allows holiday effects to influence the forecast. Tuning these parameters is important to balance model flexibility and the risk of overfitting, ensuring that the model captures genuine patterns without reacting excessively to random fluctuations.
+
+## Final Test
+
+```{r}
+# Tuning grid
+prophet_final_tuning_grid <- expand.grid(
+  changepoint_prior_scale = c(0.001),
+  seasonality_prior_scale = c(1),
+  holidays_prior_scale = c(1)
+)
+
+# Run evaluation
+prophet_final_results <- evaluate_prophet_expanding(ken_daily_orders, horizon = 14, stride = 14, initial_train_frac = 0.9, tuning_grid = prophet_final_tuning_grid)
+
+saveRDS(prophet_final_results, 
+        file = here("results", "prophet_final_results.rds"))
+
+prophet_final_results <- readRDS(here("results", "prophet_final_results.rds"))
+
+
+# Summarize
+prophet_final_predictions <- prophet_final_results$predictions[[1]]
+prophet_final_metrics <- prophet_final_results$metrics
+
+print(prophet_final_metrics)
+```
+
+### Visualizing Predictions vs Actuals
+
+```{r prophet_visualize_final_predictions}
+p <- ggplot(prophet_final_predictions, aes(x = date)) +
+  geom_line(aes(y = actual), color = "black", size = 1, linetype = "solid") +
+  geom_line(aes(y = predicted), color = "blue", size = 1, linetype = "dashed") +
+  labs(
+    title = "Actual vs Predicted Order Counts (Prophet)",
+    x = "Date",
+    y = "Order Count",
+    caption = "Black = Actual, Blue Dashed = Predicted"
+  ) +
+  theme_minimal()
+
+ggsave(
+  filename = here::here("results", "prophet", "prohet_pred_vs_actual.png"),
+  plot = p,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+
+```
+
+### Residuals
+
+Ljung Box may not be best statistic, because we have a systematic difference betweeen weekdays and weekends concerning order count, also thus the residuals differ significantly, as the variance increases as the order amount increases.
+
+Furthermore, If your goal is pure prediction, and you’ve evaluated your model with strong metrics on unseen test data, then residual autocorrelation isn’t a required check.
+
+```{r}
+# Create residuals
+prophet_final_predictions <- prophet_final_predictions %>%
+  mutate(
+    residual = actual - predicted,
+    day_of_week = weekdays(date)
+  )
+
+# 1. Residuals over time
+p1 <- ggplot(prophet_final_predictions, aes(x = date, y = residual)) +
+  geom_line(color = "darkred") +
+  labs(title = "Prophet Residuals Over Time", x = "Date", y = "Residual") +
+  theme_minimal()
+
+ggsave(filename = here("results", "prophet", "residuals_over_time.png"), plot = p1, width = 8, height = 4)
+
+# 2. ACF plot of residuals
+resid <- as.numeric(na.omit(prophet_final_predictions$residual))
+p2 <- ggAcf(resid, lag.max = 20) +
+  ggtitle("ACF of ARIMA Residuals")
+
+ggsave(filename = here("results", "prophet", "acf_residuals.png"), plot = p2, width = 6, height = 4)
+
+# 3. Residuals by day of the week
+p3 <- ggplot(prophet_final_predictions, aes(x = day_of_week, y = residual)) +
+  geom_boxplot(fill = "lightblue") +
+  labs(title = "Prophet Residuals by Day of the Week", x = "Day", y = "Residual") +
+  theme_minimal()
+
+ggsave(filename = here("results", "prophet", "residuals_by_weekday.png"), plot = p3, width = 6, height = 4)
+
+# 4. Predicted vs Actual
+p4 <- ggplot(prophet_final_predictions, aes(x = actual, y = predicted)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Predicted vs Actual", x = "Actual", y = "Predicted") +
+  theme_minimal()
+
+ggsave(filename = here("results", "prophet", "predicted_vs_actual.png"), plot = p4, width = 6, height = 4)
+
+p1
+p2
+p3
+p4
+```
+
+```{r}
+# Create residuals
+prophet_final_predictions <- prophet_final_predictions %>%
+  mutate(residual = actual - predicted)
+
+"Plot residuals over time"
+ggplot(prophet_final_predictions, aes(x = date, y = residual)) +
+  geom_line(color = "darkred") +
+  labs(title = "Prophet Residuals Over Time",
+       x = "Date", y = "Residual") +
+  theme_minimal()
+
+"Check for autocorrelation"
+acf(prophet_final_predictions$residual, na.action = na.pass,
+    main = "ACF of Propphet Residuals")
+
+"Ljung-Box Test for autocorrelation"
+# Deseasonalize residuals
+resid <- prophet_final_predictions$residual
+resid_ts <- ts(resid, frequency = 7)  # weekly seasonality
+stl_decomp <- stl(resid_ts, s.window = "periodic")
+resid_deseasoned <- resid_ts - stl_decomp$time.series[, "seasonal"]
+
+Box.test(resid_deseasoned, lag = 14, type = "Ljung-Box")
+"
+There are structural differences between weekdays and weekends, there are systematic biases
+"
+prophet_final_predictions <- prophet_final_predictions %>%
+  mutate(day_of_week = weekdays(date))
+
+"Error distribution per weekday"
+ggplot(prophet_final_predictions, aes(x = day_of_week, y = residual)) +
+  geom_boxplot(fill = "lightblue") +
+  labs(title = "Residuals by Day of the Week",
+       x = "Day", y = "Residual") +
+  theme_minimal()
+
+"Check for bias"
+mean(prophet_final_predictions$residual)  # Close to 0? Good.
+
+ggplot(prophet_final_predictions, aes(x = actual, y = predicted)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Predicted vs Actual", x = "Actual", y = "Predicted")
+```
+
+# XGboost
+
+## Preparation
+
+```{r}
+# Importing data again
+ken_daily_orders <- read.csv(here("Data","ken_daily_orders_variables.csv"))
+
+ken_daily_orders <- ken_daily_orders %>%
+  mutate(datum_creatie = as.Date(datum_creatie))
+
+# Training data: Get first 90% of rows
+n <- nrow(ken_daily_orders)
+training_data <- ken_daily_orders %>% dplyr::slice(1:floor(0.9 * n))
+
+```
+
+```{r}
+# Prepare Adding the lags
+prepare_features <- function(data, lag_days = c(1, 7), break_date = as.Date("2023-04-08")) {
+  data <- data %>%
+    mutate(
+      datum_creatie = as.Date(datum_creatie),
+      day_of_week = factor(weekdays(datum_creatie)),
+      trend_post_break = ifelse(datum_creatie > break_date, as.numeric(datum_creatie - break_date), 0)
+    ) %>%
+    arrange(datum_creatie)
+
+  for (lag in lag_days) {
+    data <- data %>%
+      mutate(!!paste0("lag_", lag) := lag(log_order_count, lag))
+  }
+
+  data <- data %>%
+    filter(rowSums(is.na(select(., starts_with("lag_")))) == 0)
+
+  return(data)
+}
+
+data_prepared_training <- prepare_features(training_data)
+```
+
+## Evaluation Function
+
+```{r used}
+expanding_window_xgboost <- function(data, horizon = 14, stride = 7, initial_train_frac = 0.8,
+                                     tuning_grid, seeds = c(123, 456, 789)) {
+  n <- nrow(data)
+  initial_train_end <- floor(initial_train_frac * n)
+
+  metrics_list <- list()
+  predictions_list <- list()
+
+  for (i in 1:nrow(tuning_grid)) {
+    params <- tuning_grid[i, ]
+    all_wmapes <- c()
+    all_wmpes <- c()
+    all_rmses <- c()
+    preds_df_all <- data.frame()
+
+    for (seed in seeds) {
+      set.seed(seed)
+
+      start <- 1
+      end <- initial_train_end
+
+      while ((end + horizon) <= n) {
+        train_data <- data[start:end, ]
+        test_data <- data[(end + 1):(end + horizon), ]
+
+        x_train <- model.matrix(~ . -1, data = select(train_data, starts_with("lag_"), trend_post_break, is_SchoolHoliday, is_PublicHoliday, day_of_week))
+        y_train <- train_data$log_order_count
+
+        x_test <- model.matrix(~ . -1, data = select(test_data, starts_with("lag_"), trend_post_break, is_SchoolHoliday, is_PublicHoliday, day_of_week))
+        y_test <- test_data$log_order_count
+
+        dtrain <- xgb.DMatrix(data = x_train, label = y_train)
+        dtest <- xgb.DMatrix(data = x_test)
+
+        model <- xgboost(
+          data = dtrain,
+          nrounds = params$nrounds,
+          eta = params$eta,
+          max_depth = params$max_depth,
+          #subsample = params$subsample,
+          #colsample_bytree = params$colsample_bytree,
+          min_child_weight = params$min_child_weight,
+          gamma = params$gamma,
+          objective = "reg:squarederror",
+          verbose = 0
+        )
+
+        preds_log <- predict(model, dtest)
+        preds_original <- exp(preds_log)
+        actual <- test_data$order_count
+        dates <- test_data$datum_creatie
+
+        preds_df_all <- bind_rows(preds_df_all, data.frame(date = dates, actual = actual, predicted = preds_original, seed = seed))
+
+        all_wmapes <- c(all_wmapes, sum(abs(actual - preds_original), na.rm = TRUE) / sum(actual, na.rm = TRUE) * 100)
+        all_wmpes  <- c(all_wmpes, sum(actual - preds_original, na.rm = TRUE) / sum(actual, na.rm = TRUE) * 100)
+        all_rmses  <- c(all_rmses, rmse(actual, preds_original))
+
+        end <- end + stride
+      }
+    }
+
+    metrics_list[[i]] <- data.frame(
+      nrounds = params$nrounds,
+      eta = params$eta,
+      max_depth = params$max_depth,
+      min_child_weight = params$min_child_weight,
+      #subsample = params$subsample,
+      #colsample_bytree = params$colsample_bytree,
+      gamma = params$gamma,
+      wMAPE_mean = mean(all_wmapes),
+      wMPE_mean = mean(all_wmpes),
+      RMSE_mean = mean(all_rmses)
+    )
+
+    pred_name <- paste0(
+      "n=", params$nrounds,
+      "_eta=", params$eta,
+      "_depth=", params$max_depth,
+      "_minchild=", params$min_child_weight,
+      "_gamma=", params$gamma
+    )
+    predictions_list[[pred_name]] <- preds_df_all
+  }
+
+  metrics_df <- bind_rows(metrics_list)
+
+  return(list(metrics = metrics_df, predictions = predictions_list))
+}
+```
+
+## Tuning Model
+
+```{r Tuning grid}
+xgb_tuning_grid <- expand.grid(
+  nrounds = c(200, 500, 1000),
+  eta = c(0.05, 0.1, 0.3),
+  max_depth = c(3, 5, 7),
+  min_child_weight = c(1, 5),
+  gamma = c(0, 1)
+)
+# 16 combinations in total
+
+xgb_tuning_results <- expanding_window_xgboost(data_prepared_training, horizon = 14, stride = 7, initial_train_frac = 0.8, tuning_grid = xgb_tuning_grid, seeds = c(123, 456, 789))
+
+saveRDS(xgb_tuning_results, 
+        file = here("results", "xgb_tuning_results.rds"))
+
+# 1. Load the RDS file
+xgb_tuning_results <- readRDS(here("results", "xgb_tuning_results.rds"))
+
+xgb_tuning_results_metrics <- xgb_tuning_results$metrics %>% 
+  mutate(across(where(is.numeric), ~ round(.x, 3)))%>% 
+  arrange(wMAPE_mean)
+
+# Saving metrics
+write.csv(xgb_tuning_results_metrics, 
+          file = here("Results", "xgb_tuning_results_metrics.csv"), 
+          row.names = FALSE) 
+
+```
+
+## Final Test
+
+```{r final_results_xgboost}
+data_prepared_final <- prepare_features(ken_daily_orders)
+
+xgb_tuning_grid_final<- expand.grid(
+  nrounds = c(200),
+  eta = c(0.05),
+  max_depth = c(3),
+  min_child_weight = c(5),
+  #subsample = c(1),
+  #colsample_bytree = c(0.7),
+  gamma = c(0)
+)
+
+set.seed(123)
+xgb_results_final <- expanding_window_xgboost(data_prepared_final, horizon = 14, stride = 14, tuning_grid = xgb_tuning_grid_final, initial_train_frac = 0.9)
+
+xgb_final_predictions <- xgb_results_final$predictions[[1]]
+xgb_final_metrics <- xgb_results_final$metrics
+
+print(xgb_final_metrics)
+
+```
+
+### Visualizing
+
+```{r final_graph_xgboost}
+p <- ggplot(xgb_final_predictions, aes(x = date)) +
+  geom_line(aes(y = actual), color = "black", size = 1, linetype = "solid") +
+  geom_line(aes(y = predicted), color = "blue", size = 1, linetype = "dashed") +
+  labs(
+    title = "Actual vs Predicted Order Counts (XGBoost)",
+    x = "Date",
+    y = "Order Count",
+    caption = "Black = Actual, Blue Dashed = Predicted"
+  ) +
+  theme_minimal()
+
+# Saving plot
+ggsave(
+  filename = here::here("results", "xgboost", "my_plot.png"),
+  plot = p,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+
+print(p)
+```
+
+### Residuals
+
+```{r}
+# Create residuals
+xgb_final_predictions <- xgb_final_predictions %>%
+  mutate(
+    residual = actual - predicted,
+    day_of_week = weekdays(date)
+  )
+
+# 1. Residuals over time
+p1 <- ggplot(xgb_final_predictions, aes(x = date, y = residual)) +
+  geom_line(color = "darkblue") +
+  labs(title = "XGBoost Residuals Over Time", x = "Date", y = "Residual") +
+  theme_minimal()
+
+ggsave(filename = here("results", "xgboost", "residuals_over_time.png"), plot = p1, width = 8, height = 4)
+
+# 2. ACF plot of residuals (if you actually want an ACF plot, not a duplicate of p1)
+resid <- as.numeric(na.omit(xgb_final_predictions$residual))
+acf_plot <- acf(resid, plot = FALSE)
+acf_df <- data.frame(lag = acf_plot$lag, acf = acf_plot$acf)
+
+p2 <-  ggAcf(xgb_final_predictions$residual, lag.max = 20) +
+  ggtitle("ACF of XGBoost Residuals")
+
+ggsave(filename = here("results", "xgboost", "acf_residuals.png"), plot = p2, width = 6, height = 4)
+
+# 3. Residuals by day of the week
+p3 <- ggplot(xgb_final_predictions, aes(x = day_of_week, y = residual)) +
+  geom_boxplot(fill = "lightblue") +
+  labs(title = "XGBoost Residuals by Day of the Week", x = "Day", y = "Residual") +
+  theme_minimal()
+
+ggsave(filename = here("results", "xgboost", "residuals_by_weekday.png"), plot = p3, width = 6, height = 4)
+
+# 4. Predicted vs Actual
+p4 <- ggplot(xgb_final_predictions, aes(x = actual, y = predicted)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "XGBoost Predicted vs Actual", x = "Actual", y = "Predicted") +
+  theme_minimal()
+
+ggsave(filename = here("results", "xgboost", "predicted_vs_actual.png"), plot = p4, width = 6, height = 4)
+
+# Optionally print the plots
+p1
+p2
+p3
+p4
+```
+
+# Final model 
+
+The Prophet model was chosen.
+
+```{r function_future_xgboost}
+forecast_xgboost_recursive <- function(data, horizon = 14) {
+  library(dplyr)
+
+  # Define levels for day_of_week to avoid contrast errors
+  weekday_levels <- c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+  # Copy original data and set up correctly
+  data_forecast <- data
+  data_forecast$day_of_week <- factor(data_forecast$day_of_week, levels = weekday_levels)
+  data_forecast$log_predicted <- data_forecast$log_order_count  # for lag_1 use
+
+  # Prepare training matrix
+  x_train <- model.matrix(~ . -1, data = select(data_forecast, starts_with("lag_"), trend_post_break, is_SchoolHoliday, is_PublicHoliday, day_of_week))
+  y_train <- data_forecast$log_order_count
+  feature_names <- colnames(x_train)
+
+  dtrain <- xgb.DMatrix(data = x_train, label = y_train)
+
+  # Train final model
+  model <- xgboost(
+    data = dtrain,
+    nrounds = 200,
+    eta = 0.1,
+    max_depth = 5,
+    min_child_weight = 5,
+    gamma = 0,
+    objective = "reg:squarederror",
+    verbose = 0
+  )
+
+  # Forecasting loop
+  future_preds <- data.frame()
+  for (i in 1:horizon) {
+    last_row <- tail(data_forecast, 1)
+
+    # Create new row for next day
+    next_date <- last_row$datum_creatie + 1
+    new_row <- last_row
+    new_row$datum_creatie <- next_date
+
+    # Shift lag values
+    for (j in rev(2:14)) {
+      lag_col <- paste0("lag_", j)
+      prev_lag_col <- paste0("lag_", j - 1)
+      new_row[[lag_col]] <- new_row[[prev_lag_col]]
+    }
+    new_row$lag_1 <- last_row$log_predicted  # yesterday's forecasted log
+
+    # Generate non-lag future features (simplified example)
+    new_row$day_of_week <- weekdays(next_date, abbreviate = TRUE)
+    new_row$day_of_week <- factor(new_row$day_of_week, levels = weekday_levels)
+    new_row$is_SchoolHoliday <- 0  # placeholder
+    new_row$is_PublicHoliday <- 0  # placeholder
+    new_row$trend_post_break <- last_row$trend_post_break + 1
+
+    # Create x matrix for prediction
+    x_new <- model.matrix(~ . -1, data = select(new_row, starts_with("lag_"), trend_post_break, is_SchoolHoliday, is_PublicHoliday, day_of_week))
+
+    # Align and fix shape
+    missing_cols <- setdiff(feature_names, colnames(x_new))
+    for (col in missing_cols) {
+      x_new <- cbind(x_new, setNames(rep(0, nrow(x_new)), col))
+    }
+    x_new <- x_new[, feature_names, drop = FALSE]
+
+    # Predict
+    dpred <- xgb.DMatrix(data = x_new)
+    log_forecast <- predict(model, dpred)
+    pred_count <- exp(log_forecast)
+
+    # Store prediction
+    new_row$log_order_count <- NA
+    new_row$log_predicted <- log_forecast
+    new_row$predicted_order_count <- pred_count
+    new_row$order_count <- NA
+
+    future_preds <- bind_rows(future_preds, data.frame(date = next_date, predicted_order_count = pred_count))
+    data_forecast <- bind_rows(data_forecast, new_row)
+  }
+
+  return(future_preds)
+}
+```
+
+```{r}
+forecast_data <- prepare_features(ken_daily_orders)
+
+# Run the function
+final_forecast <- forecast_xgboost_recursive(ken_daily_orders)
+
+final_forecast$predicted_order_count <- ceiling(final_forecast$predicted_order_count)
+
+write.csv(final_forecast, file = here("results", "final_forecast.csv"), row.names = FALSE)
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# Take the last 30 days of actual data
+plot_actual <- ken_daily_orders %>%
+  select(date = datum_creatie, actual_order_count = order_count) %>%
+  filter(date >= max(date) - 29)
+
+# Combine with forecast data
+plot_forecast <- final_forecast %>%
+  rename(actual_order_count = predicted_order_count) %>%
+  mutate(source = "Forecast")
+
+plot_actual <- plot_actual %>%
+  mutate(source = "Actual")
+
+# Combine into one plot dataset
+plot_data <- bind_rows(plot_actual, plot_forecast)
+
+# Plot
+ggplot(plot_data, aes(x = date, y = actual_order_count, color = source)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  labs(
+    title = "14-Day Forecast vs. Last Month of Actual Orders",
+    x = "Date",
+    y = "Order Count",
+    color = "Legend"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+# Remarks
+
+Due to the 14-day rolling forecast horizon and stride used in cross-validation, the last predicted date is April 15, 2025, slightly earlier than the final observation date (April 24, 2025). This is a natural consequence of the forecasting window and does not materially impact the results or evaluation, as the model was not expected to extrapolate beyond available data.

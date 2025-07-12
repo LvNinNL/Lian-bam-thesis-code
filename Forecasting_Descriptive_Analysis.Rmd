@@ -1,0 +1,974 @@
+---
+title: "BAM Thesis - timeseries"
+author: "Lian van Nee"
+date: "2025-04-28"
+output: word_document
+---
+
+# Libraries
+
+```{r}
+library(here)
+library(tidyverse)
+library(lubridate)
+library(tsibble)
+library(stringr)
+library(readr)
+library(purrr)
+library(dplyr)
+library(tidyr)
+library(readxl)
+library(forecast)
+library(tseries)
+library(strucchange)
+library(ppcor)
+library(conflicted)
+library(zoo)
+library(prophet)
+library(Metrics)
+library(ggplot2)
+library(Matrix)
+library(xgboost)
+library(broom)
+
+
+options(contrasts = c("contr.treatment", "contr.treatment"))
+conflict_prefer("select", "dplyr")
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::lag)
+```
+
+# Importing & Cleaning Data
+
+```{r}
+"Importing Glims data"
+# Data Loading I have split it up in smaller parts so that it can be uploaded to GIT
+# List all the chunks
+chunk_files <- list.files(
+  path = here("Data", "Order_data"),
+  pattern = "data_chunk_.*\\.csv",
+  full.names = TRUE
+)
+# Load and combine the chunks back into one dataset
+data <- do.call(rbind, lapply(chunk_files, read.csv))
+# Remove empty rows
+data <- data[rowSums(is.na(data)) != ncol(data), ]
+
+# We start with 4577229 observations
+
+"Making adjustments to data"
+# Changing dates to data format
+data$datum_creatie <- as.Date(data$datum_creatie, format = "%d/%m/%Y")
+data$datum_afname <- as.Date(data$datum_afname, format = "%d/%m/%Y")
+
+# Changing Cito to binary variable
+data <- data %>%
+  mutate(Cito = if_else(Cito_JN == "Cito", 1, 0)) %>% 
+  select(-Cito_JN, -peildatum)
+
+"Adding variables"
+
+# Adding testing variable
+data <- data %>%
+  mutate(self_testing = ifelse(str_detect(afname_locatie, "^[0-9]"), 1, 0))
+
+"Deleting huisbezoek, selftesting and Cito data"
+data_clean <- data %>%
+  filter((data$huisbezoek != 1 | is.na(data$huisbezoek)) &
+  (data$self_testing != 1 | is.na(data$self_testing)) &
+  (data$Cito != 1 | is.na(data$Cito)))
+# nrow(data_clean) = 3782446
+```
+
+## Kennemerland Specific Data
+
+```{r}
+# Getting all Kennemerland Postal Codes
+kennemerland_postalcodes <- data %>% 
+  filter(BD_regio %in% c("Kennemerland Zuid", "Kennemerland Noord", "Hoofddorp")) %>% 
+  distinct(postcode_patient) %>% 
+  mutate(PC4 = as.character(postcode_patient)) %>%
+  select(-postcode_patient)
+
+# creating data_clean for Kennemerland
+ken_data_clean <- data_clean %>% 
+  filter(postcode_patient %in% kennemerland_postalcodes$PC4) %>%
+  filter(!datum_creatie=="2025-04-25") # Delete 2025-04-25, as this day was not fully recorded
+nrow(ken_data_clean)
+# should be 1506410
+
+write.csv(ken_data_clean, file = here::here("Data", "ken_order_data_clean.csv"), row.names = FALSE)
+```
+
+## Creating ken_daily orders
+
+```{r}
+ken_daily_orders <- ken_data_clean %>%
+  group_by(datum_creatie) %>%
+  summarise(order_count = n(), .groups = "drop")
+
+ken_daily_orders %>%
+  summary(order_count)
+
+# Total number of days
+nrow(ken_daily_orders)
+
+# Check for missing days
+all_dates <- data.frame(
+  datum_creatie = seq.Date(from = as.Date("2022-01-01"),
+                           to = as.Date("2025-04-24"),
+                           by = "day"))
+
+# Join with your existing dataset to find missing dates
+missing_dates <- all_dates %>%
+  anti_join(ken_daily_orders, by = "datum_creatie")
+
+# View results
+print(missing_dates) # THere are no missing dates
+```
+
+## Demand Distribution + Var per daytype
+
+```{r summary statistics per weekday}
+ken_daily_orders <- ken_data_clean %>%
+  group_by(datum_creatie) %>%
+  summarise(order_count = n(), .groups = "drop") %>%
+  arrange(datum_creatie) %>%
+  mutate(weekday = wday(datum_creatie, label = TRUE, abbr = FALSE))
+
+# Summary statistics per weekday
+ken_summary_table_per_day <- ken_daily_orders %>%
+  group_by(weekday) %>%
+  summarise(
+    count = n(),
+    mean = mean(order_count),
+    sd = sd(order_count),
+    min = min(order_count),
+    q25 = quantile(order_count, 0.25),
+    median = median(order_count),
+    q75 = quantile(order_count, 0.75),
+    max = max(order_count)
+  ) %>%
+  arrange(factor(weekday, levels = c(
+    "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"
+  )))
+
+write.csv(ken_summary_table_per_day, here("summary_tables", "ken_summary_table_per_day.csv"), row.names = FALSE)
+```
+
+```{r histogram distribution of daily order count}
+"Difference Weekend and Weekday"
+ken_daily_orders <- ken_daily_orders %>%
+  mutate(day_type = if_else(wday(datum_creatie, label = TRUE) %in% c("Sat", "Sun"),
+                            "Weekend", "Weekday"),
+         day_type = factor(day_type, levels = c("Weekend", "Weekday")))
+
+ggplot(ken_daily_orders, aes(x = order_count, fill = day_type)) +
+  geom_histogram(binwidth = 15, position = "identity", alpha = 0.9) +
+  scale_fill_manual(values = c("Weekday" = "cornflowerblue", "Weekend" = "indianred")) +
+  labs(title = "Distribution of Daily Order Counts by Day Type",
+       x = "Order Count (per day)", y = "Number of Days",
+       fill = "Day Type") +
+  theme_minimal()
+
+ggsave(
+  filename = here("figures", "distribution_daily_order_counts_per_day_type.png"),
+  width = 10, height = 6, dpi = 300
+)
+```
+
+```{r}
+# Add log-transformed order count
+ken_daily_orders <- ken_daily_orders %>%
+  mutate(log_order_count = log(order_count))
+
+# Plot
+ggplot(ken_daily_orders, aes(x = log_order_count, fill = day_type)) +
+  geom_histogram(binwidth = 0.05, position = "identity", alpha = 0.9) +
+  scale_fill_manual(values = c("Weekday" = "cornflowerblue", "Weekend" = "indianred")) +
+  labs(title = "Log-Transformed Distribution of Daily Order Counts by Day Type",
+       x = "Log(Order Count)", y = "Number of Days",
+       fill = "Day Type") +
+  theme_minimal()
+
+# Saving
+ggsave(
+  filename = here("figures", "distribution_daily_log_order_counts_per_day_type.png"),
+  width = 10, height = 6, dpi = 300
+)
+```
+
+```{r combining the two graphs into one}
+library(patchwork)
+
+ken_daily_orders <- ken_daily_orders %>%
+  mutate(day_type = if_else(wday(datum_creatie, label = TRUE) %in% c("Sat", "Sun"),
+                            "Weekend", "Weekday"),
+         day_type = factor(day_type, levels = c("Weekend", "Weekday")),
+         log_order_count = log(order_count))
+
+# Plot 1: Original order count distribution
+p1 <- ggplot(ken_daily_orders, aes(x = order_count, fill = day_type)) +
+  geom_histogram(binwidth = 15, position = "identity", alpha = 0.9) +
+  scale_fill_manual(values = c("Weekday" = "cornflowerblue", "Weekend" = "indianred")) +
+  labs(title = "Raw Order Count", x = "Order Count (per day)", y = "Number of Days", fill = "Day Type") +
+  theme_minimal()
+
+# Plot 2: Log-transformed order count distribution
+p2 <- ggplot(ken_daily_orders, aes(x = log_order_count, fill = day_type)) +
+  geom_histogram(binwidth = 0.05, position = "identity", alpha = 0.9) +
+  scale_fill_manual(values = c("Weekday" = "cornflowerblue", "Weekend" = "indianred")) +
+  labs(title = "Log-Transformed Order Count", x = "Log(Order Count)", y = "Number of Days", fill = "Day Type") +
+  theme_minimal()
+
+# Combine with patchwork
+combined_plot <- p1 + p2 + plot_layout(guides = "collect") & theme(legend.position = "bottom")
+
+# Save using here()
+ggsave(
+  filename = here("figures", "combined_order_count_distribution.png"),
+  plot = combined_plot,
+  width = 10,  # adjust as needed for your thesis format
+  height = 5,  # adjust as needed
+  dpi = 300
+)
+```
+
+## Interweekly patterns
+
+```{r performing-tests}
+"Adding DoW as variable"
+ken_daily_orders <- ken_daily_orders %>% 
+  mutate(
+    day_of_week = as.factor(wday(datum_creatie, label = TRUE, week_start = 1))
+  )
+
+"Showing means per weekday"
+ken_daily_orders %>%
+  group_by(day_of_week) %>%
+  summarise(
+    mean_orders = mean(order_count),
+    sd_orders = sd(order_count),
+    .groups = "drop"
+  )
+
+"Performing an Anova test to see differences between weekdays"
+weekdays_only <- ken_daily_orders %>%
+  filter(day_of_week %in% c("Mon", "Tue", "Wed", "Thu", "Fri")) %>%
+  mutate(day_of_week = factor(day_of_week)) %>%
+  droplevels()
+
+anova_weekdays <- aov(order_count ~ day_of_week, data = ken_daily_orders)
+summary(anova_weekdays)
+# Saving result so it can be inserted into text
+anova_tidy <- tidy(anova_weekdays)
+write.csv(anova_tidy, here::here("summary_tables", "anova_weekday.csv"), row.names = FALSE)
+
+"Tukey Test"
+tukey_result <- TukeyHSD(anova_weekdays)
+
+# For thesis insertion
+tukey_tidy <- broom::tidy(tukey_result)
+write.csv(tukey_tidy, here::here("summary_tables", "tukey_weekday.csv"), row.names = FALSE)
+
+```
+
+```{r visualizing-week-patterns}
+"Visualizing"
+ken_daily_orders <- ken_data_clean %>%
+  group_by(datum_creatie) %>%
+  summarise(order_count = n()) %>%
+  arrange(datum_creatie) %>%
+  mutate(
+    day_of_week = wday(datum_creatie, label = TRUE, abbr = FALSE, week_start = 1),
+    week_start_date = floor_date(datum_creatie, unit = "week", week_start = 1),
+    week_numeric = as.numeric(week_start_date),
+    week_label = paste0(year(week_start_date), " W", sprintf("%02d", isoweek(week_start_date)))
+  )
+
+# Choosing colors
+soft_colors <- c(
+  "#3B82F6",  # vivid blue
+  "#60A5FA",  # sky blue
+  "#EC4899",  # pinkish red
+  "#F87171",  # warm red
+  "#FCD34D",  # soft yellow (adds contrast)
+  "#6EE7B7",  # light green
+  "#10B981"   # bold green
+)
+
+# Choose breaks and labels for legend
+week_breaks <- sort(unique(ken_daily_orders$week_numeric))[seq(1, length(unique(ken_daily_orders$week_numeric)), length.out = 6)]
+week_labels <- ken_daily_orders %>%
+  filter(week_numeric %in% week_breaks) %>%
+  distinct(week_numeric, week_label) %>%
+  arrange(week_numeric) %>%
+  pull(week_label)
+
+# Plot
+ggplot(ken_daily_orders, aes(x = day_of_week, y = order_count, group = week_start_date, color = week_numeric)) +
+  geom_line(alpha = 0.8, size = 0.3) +
+  scale_color_gradientn(
+    colours = soft_colors,
+    breaks = week_breaks,
+    labels = week_labels,
+    name = "Week"
+  ) +
+  labs(
+    x = "Day of the Week",
+    y = "Number of Orders",
+    title = "Weekly Order Patterns by Day"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 8)
+  )
+
+ggsave(here("figures", "weekly_orders_plot.png"),width = 10, height = 6, dpi = 300)
+```
+
+## Monthly patterns
+
+```{r analysis-monthly-patterns}
+ken_daily_orders <- ken_daily_orders %>%
+  mutate(
+    log_order_count = log1p(order_count)
+  )
+
+"Adding Month as variable"
+ken_daily_orders <- ken_daily_orders %>% 
+  mutate(
+    month = factor(month(datum_creatie, label = TRUE), levels = month.abb),
+    year = year(datum_creatie)
+  )
+
+"Showing means and deviations per month"
+monthly_summary <- ken_daily_orders %>%
+  group_by(month) %>%
+  summarise(
+    mean_orders = mean(order_count),
+    sd_orders = sd(order_count),
+    .groups = "drop"
+  )
+
+print(monthly_summary)
+
+"ANOVA test"
+anova_month <- aov(order_count ~ month, data = ken_daily_orders)
+summary(anova_month)
+
+# Saving result so it can be inserted into text
+anova_tidy <- tidy(anova_month)
+write.csv(anova_tidy, here::here("summary_tables", "anova_month.csv"), row.names = FALSE)
+```
+
+```{r visualization-monhtly-patterns}
+"Visualization"
+monthly_total_year <- ken_daily_orders %>%
+  mutate(month = factor(month(datum_creatie, label = TRUE), levels = month.abb)) %>%
+  group_by(year, month) %>%
+  summarise(total_orders = sum(order_count), .groups = "drop")
+
+# Define your custom color palette
+custom_colors <- c(
+  "2022" = "#60A5FA",  # light blue
+  "2023" = "#EC4899",  # pink
+  "2024" = "#F87171",  # red
+  "2025" = "#FCD34D"   # yellow
+)
+
+# Plot
+ggplot(monthly_total_year, aes(x = month, y = total_orders, group = factor(year), color = factor(year))) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  scale_color_manual(values = custom_colors, name = "Year") +
+  labs(
+    title = "Total Monthly Order Volume by Year",
+    x = "Month",
+    y = "Total Orders per Month"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9)
+  )
+
+ggsave(here("figures", "monthly_total_order_volume_plot.png"),width = 10, height = 6, dpi = 300)
+```
+
+## Autocorrelation Analysis
+
+```{r}
+library(forecast)
+library(patchwork)
+
+p1 <- ggAcf(ken_daily_orders$order_count) + ggtitle("ACF of Daily Order Count")
+p2 <- ggPacf(ken_daily_orders$order_count) + ggtitle("PACF of Daily Order Count")
+
+p1 / p2
+combined_plot <- p1 / p2
+
+# Save
+ggsave(
+  filename = here::here("figures", "acf_pacf_combined.png"),
+  plot = combined_plot,
+  width = 8, height = 6
+)
+```
+
+# External Variables
+
+Due to the large diference in order volumes between weekdays (\~1800 orders) and weekends (\~50 orders), the variance in the response variable is expected to be non-constant. To stabilize the variance and reduce skewness, a log transformation of the response variable was applied prior to modeling. This means that also in exploratory research, the linear models looking at the usefulness of an external factor will also be conducted using log orders.
+
+```{r creating log orders}
+ken_daily_orders <- ken_daily_orders %>%
+  mutate(log_orders = log(order_count + 1))
+```
+
+## Public & School holidays
+
+```{r importing data and adding to df}
+"import datasets"
+public_holidays_nl <- read_excel(here("Data", "External_Variables", "public_holidays_nl.xlsx"))
+school_holidays <- read_excel(here("Data", "External_Variables", "dates_school_holidays.xlsx"))
+
+public_holidays_nl$date <- as.Date(public_holidays_nl$date)
+school_holidays$date <- as.Date(school_holidays$date)
+
+"Adding variables to dataframe"
+ken_daily_orders <- ken_daily_orders %>% 
+  mutate(
+    is_PublicHoliday = ifelse(datum_creatie %in% public_holidays_nl$date, 1, 0),
+    is_SchoolHoliday = ifelse(datum_creatie %in% school_holidays$date, 1, 0),
+  )
+```
+
+```{r regression}
+"Correlation"
+cor(ken_daily_orders %>% select(order_count, is_PublicHoliday), use = "complete.obs")
+cor(ken_daily_orders %>% select(log_orders, is_PublicHoliday), use = "complete.obs")
+
+"See if school/public holidays significantly improves the model"
+model_1 <- lm(order_count ~ day_of_week, data = ken_daily_orders)
+
+model_3 <- lm(order_count ~ day_of_week + is_SchoolHoliday, data = ken_daily_orders)
+model_4 <- lm(order_count ~ day_of_week*is_SchoolHoliday, data = ken_daily_orders)
+model_5 <- lm(order_count ~ day_of_week*is_SchoolHoliday + is_PublicHoliday, data = ken_daily_orders)
+
+model_6 <- lm(order_count ~ day_of_week + is_PublicHoliday, data = ken_daily_orders)
+model_7 <- lm(order_count ~ day_of_week*is_PublicHoliday, data = ken_daily_orders)
+model_8 <- lm(order_count ~ day_of_week*is_PublicHoliday + is_SchoolHoliday, data = ken_daily_orders)
+
+model_9 <- lm(order_count ~ day_of_week * (is_PublicHoliday + is_SchoolHoliday), data = ken_daily_orders)
+
+
+"Log variation of model"
+model_1 <- lm(log_orders ~ day_of_week, data = ken_daily_orders)
+
+model_3 <- lm(log_orders ~ day_of_week + is_SchoolHoliday, data = ken_daily_orders)
+model_4 <- lm(log_orders ~ day_of_week*is_SchoolHoliday, data = ken_daily_orders)
+model_5 <- lm(log_orders ~ day_of_week*is_SchoolHoliday + is_PublicHoliday, data = ken_daily_orders)
+
+model_6 <- lm(log_orders ~ day_of_week + is_PublicHoliday, data = ken_daily_orders)
+model_7 <- lm(log_orders ~ day_of_week*is_PublicHoliday, data = ken_daily_orders)
+model_8 <- lm(log_orders ~ day_of_week*is_PublicHoliday + is_SchoolHoliday, data = ken_daily_orders)
+
+model_9 <- lm(log_orders ~ day_of_week * (is_PublicHoliday + is_SchoolHoliday), data = ken_daily_orders)
+
+
+summary(model_3)
+summary(model_4)
+summary(model_5)
+summary(model_6)
+
+anova(model_1, model_3, model_4, model_5, model_9)
+anova(model_1, model_6, model_7, model_8, model_9)
+
+plot(model_9)
+```
+
+```{r visualizing public and schoolholidays}
+ken_weekly_orders <- ken_daily_orders %>%
+  mutate(week = floor_date(datum_creatie, unit = "week", week_start = 1)) %>%
+  group_by(week) %>%
+  summarise(
+    weekly_order_count = sum(order_count),
+    is_PublicHoliday = sum(is_PublicHoliday) > 0,
+    is_SchoolHoliday = sum(is_SchoolHoliday) > 0
+  ) %>%
+  ungroup() %>%
+  filter(week < max(week) & week > min(week)) # Exclude last and first weeks, as it is incomplete
+
+# Retrieving holiday labels
+public_holiday_labels <- public_holidays_nl %>%
+  mutate(
+    week = floor_date(date, unit = "week", week_start = 1),
+    holiday_label = format(date, "%a")  # just the weekday abbreviation
+  ) %>%
+  group_by(week) %>%
+  summarise(holiday_label = paste(unique(holiday_label), collapse = ", "))
+
+# Get unique week-holiday combinations
+school_weekly_holidays <- school_holidays %>%
+  filter(date <= max(ken_daily_orders$datum_creatie)) %>%  # exclude any holidays after data ends
+  mutate(week = floor_date(date, unit = "week", week_start = 1),
+         holiday_name = gsub("Holidays", "", holiday_name),           # remove 'Holidays'
+    holiday_name = trimws(holiday_name)) %>%
+  distinct(week, holiday_name) %>%
+  arrange(holiday_name, week)
+
+school_weekly_holidays <- school_weekly_holidays %>%
+  group_by(holiday_name) %>%
+  arrange(week) %>%
+  mutate(
+    gap = as.numeric(week - lag(week, default = first(week))) > 7,
+    group_id = cumsum(gap)
+  ) %>%
+  ungroup()
+
+holiday_blocks <- school_weekly_holidays %>%
+  group_by(holiday_name, group_id) %>%
+  summarise(label_week = week[ceiling(n() / 2)], .groups = "drop") %>%
+  rename(holiday_name = holiday_name)
+
+# Adding labels to dataset
+ken_weekly_orders_labeled <- ken_weekly_orders %>%
+  left_join(public_holiday_labels, by = "week") %>% 
+  left_join(school_holiday_labels, by = "week")
+  
+ggplot() +
+  # School holiday shading
+  geom_rect(data = subset(ken_weekly_orders, is_SchoolHoliday),
+            aes(xmin = week - 3.5, xmax = week + 3.5, ymin = -Inf, ymax = Inf),
+            fill = "#FF7F50", alpha = 0.2) +
+
+  # Weekly trend line
+  geom_line(data = ken_weekly_orders,
+            aes(x = week, y = weekly_order_count),
+            color = "#60A5FA", size = 1) +
+
+  # Red crosses for public holidays
+  geom_point(data = subset(ken_weekly_orders, is_PublicHoliday),
+             aes(x = week, y = weekly_order_count),
+             shape = 4, color = "red", size = 3) +
+  
+  # Label of Public holiday
+  geom_text(data = subset(ken_weekly_orders_labeled, is_PublicHoliday),
+          aes(x = week, y = weekly_order_count + 500, label = holiday_label),
+          angle = 90, hjust = 0.5, vjust = 0, size = 2, color = "black") +
+
+  # Single vertical label per school holiday block
+  geom_text(data = holiday_blocks,
+            aes(x = label_week, y = Inf, label = holiday_name),
+            angle = 90, vjust = 0.7, hjust = 1, size = 2.5, color = "#F87171") +
+
+  labs(title = "Weekly Order Volume with Holiday Periods",
+       subtitle = "Orange background = School holidays; Red crosses = Public holidays",
+       x = "Week", y = "Weekly Order Count") +
+  theme_minimal()
+
+ggsave(here("figures", "weekly_order_volume_and_holiday_periods.png"),width = 10, height = 6, dpi = 300)
+```
+
+```{r}
+library(dplyr)
+library(lubridate)
+
+# Create weekly order data
+ken_weekly_orders <- ken_daily_orders %>%
+  mutate(week = floor_date(datum_creatie, unit = "week", week_start = 1)) %>%
+  group_by(week) %>%
+  summarise(
+    weekly_order_count = sum(order_count),
+    .groups = "drop"
+  )
+
+# Prepare school holiday weeks + names
+school_weekly_holidays <- school_holidays %>%
+  mutate(week = floor_date(date, unit = "week", week_start = 1)) %>%
+  distinct(week, holiday_name) %>%
+  arrange(holiday_name, week)
+
+# Group contiguous holiday weeks (assign group ID)
+school_weekly_holidays <- school_weekly_holidays %>%
+  group_by(holiday_name) %>%
+  arrange(week) %>%
+  mutate(
+    gap = as.numeric(week - lag(week, default = first(week))) > 7,
+    group_id = cumsum(gap)
+  ) %>%
+  ungroup()
+
+# Merge with weekly orders
+ken_weekly_orders_labeled <- ken_weekly_orders %>%
+  left_join(school_weekly_holidays, by = "week")
+
+# Compute average volume for each holiday block
+holiday_blocks <- ken_weekly_orders_labeled %>%
+  filter(!is.na(holiday_name)) %>%
+  group_by(holiday_name, group_id) %>%
+  summarise(
+    avg_holiday_volume = mean(weekly_order_count, na.rm = TRUE),
+    first_week = min(week),
+    .groups = "drop"
+  )
+
+# Get pre-holiday week order volume
+pre_holiday_orders <- ken_weekly_orders %>%
+  mutate(next_week = week + 7) %>%
+  select(next_week, weekly_order_count) %>%
+  rename(first_week = next_week, pre_holiday_volume = weekly_order_count)
+
+# Join holiday blocks with pre-holiday volumes
+holiday_reduction <- holiday_blocks %>%
+  left_join(pre_holiday_orders, by = "first_week") %>%
+  mutate(
+    pct_reduction = 100 * (pre_holiday_volume - avg_holiday_volume) / pre_holiday_volume
+  )
+
+# Summarize average % reduction per holiday type
+average_reduction_per_holiday <- holiday_reduction %>%
+  group_by(holiday_name) %>%
+  summarise(
+    avg_pct_reduction = mean(pct_reduction, na.rm = TRUE),
+    n_periods = n(),
+    .groups = "drop"
+  )
+
+# View result
+print(average_reduction_per_holiday)
+```
+
+## Rebound days
+
+This is day that follows after a holiday or a long weekend (not a regular weekend, that is just a monday). (We saw earlier that on weekend days, the demand is very low, naturally)
+
+```{r}
+ken_daily_orders <- ken_daily_orders %>%
+  arrange(datum_creatie) %>%
+  mutate(
+    day_of_week = wday(datum_creatie, label = TRUE, abbr = TRUE, week_start = 1),
+    is_weekday = day_of_week %in% c("Mon", "Tue", "Wed", "Thu", "Fri"),
+    was_yesterday_school_holiday = lag(is_SchoolHoliday, 1),
+
+    is_rebound_day = if_else(
+      is_weekday &
+      is_PublicHoliday == 0 &
+      is_SchoolHoliday == 0 &
+      was_yesterday_school_holiday == 1,
+      1, 0
+    )
+  ) %>%
+  select(-was_yesterday_school_holiday)
+
+"Correlation"
+cor(ken_daily_orders %>% select(log_orders, is_rebound_day), use = "complete.obs")
+
+"Linear regression"
+model_1 <- lm(log_orders ~ day_of_week, data = ken_daily_orders)
+model_6 <- lm(log_orders ~ day_of_week + is_rebound_day, data = ken_daily_orders)
+
+summary(model_1)
+summary(model_6)
+anova(model_1, model_6)
+```
+
+## Influenza Season
+
+|           |              |              |          |
+|-----------|--------------|--------------|----------|
+| 2021/2022 | Week 8 2022  | Week 20 2022 | 13 weken |
+| 2022/2023 | Week 50 2022 | Week 11 2023 | 14 weken |
+| 2023/2024 | Week 3 2024  | Week 11 2024 | 9 weken  |
+| 2024/2025 | Week 3 2025  | Week 11 2025 | 9 weken  |
+
+```{r}
+  "Adding influenza season dataset"
+# Define influenza periods
+influenza_periods <- data.frame(
+  year = c(2022, 2023, 2024, 2025),
+  start_date = as.Date(c("2022-02-21", "2022-12-12", "2024-01-15", "2025-01-13")),
+  end_date   = as.Date(c("2022-05-22", "2023-03-19", "2024-03-17", "2025-03-16"))
+)
+
+# Create daily calendar
+influenza_dates <- data.frame(
+  date = seq(as.Date("2022-01-01"), as.Date("2025-04-24"), by = "day"),
+  in_influenza = 0
+)
+
+# Flag all days within influenza periods
+for (i in 1:nrow(influenza_periods)) {
+  influenza_dates$in_influenza[
+    influenza_dates$date >= influenza_periods$start_date[i] &
+    influenza_dates$date <= influenza_periods$end_date[i]
+  ] <- 1
+}
+
+"Adding variable to ken_daily_orders dataframe"
+ken_daily_orders <- ken_daily_orders %>%
+  left_join(influenza_dates, by = c("datum_creatie" = "date"))
+
+"Visualizing the periods"
+library(ggplot2)
+ken_daily_orders$datum_creatie <- as.POSIXct(ken_daily_orders$datum_creatie)
+influenza_periods$start_date <- as.POSIXct(influenza_periods$start_date)
+influenza_periods$end_date <- as.POSIXct(influenza_periods$end_date)
+
+ggplot(ken_daily_orders, aes(x = datum_creatie)) +
+  # Add shaded region for influenza periods
+  geom_rect(data = influenza_periods,
+            aes(xmin = start_date, xmax = end_date, ymin = -Inf, ymax = Inf),
+            fill = "#F87171", alpha = 0.7, inherit.aes = FALSE) +
+  # Plot order counts
+  geom_line(aes(y = order_count), color = "#3B82F6") +
+  labs(title = "Order Count Over Time with Influenza Periods",
+       x = "Date", y = "Order Count") +
+  theme_minimal()
+
+"Correlation"
+cor(ken_daily_orders %>% select(order_count, in_influenza), use = "complete.obs")
+cor(ken_daily_orders %>% select(log_orders, in_influenza), use = "complete.obs")
+
+"Linear regression"
+model_8 <- lm(formula = order_count ~ day_of_week + in_influenza, data = ken_daily_orders)
+model_9 <- lm(formula = order_count ~ day_of_week *in_influenza, data = ken_daily_orders)
+
+model_8 <- lm(formula = log_orders ~ day_of_week , data = ken_daily_orders)
+model_9 <- lm(formula = log_orders ~ day_of_week + in_influenza, data = ken_daily_orders)
+
+summary(model_8)
+summary(model_9)
+anova(model_8, model_9)
+
+```
+
+## Hay fever
+
+```{r}
+# Create in_pollen_season variable: mid-May to mid-July each year
+ken_daily_orders <- ken_daily_orders %>%
+  mutate(in_pollen_season = if_else(
+    format(datum_creatie, "%m-%d") >= "05-15" & format(datum_creatie, "%m-%d") <= "07-15",
+    1, 0
+  ))
+
+# linear regression
+model_basic <- lm(log_orders ~ day_of_week, data = ken_daily_orders)
+model_pollen <- lm(log_orders ~ day_of_week + in_pollen_season, data = ken_daily_orders)
+
+summary(model_basic)
+summary(model_pollen)
+anova(model_basic, model_pollen)
+```
+
+## Temperature & Humidity
+
+```{r}
+"Importing weather data"
+weather_data <- read_excel(here("Data", "External_Variables", "open-meteo-avg-temp-humid.xlsx"),
+    col_types = c("date", "numeric", "numeric"))
+
+# renaming variables
+weather_data <- weather_data %>%
+  rename(
+    temperature = `temperature_2m_mean (°C)`,
+    humidity = `relative_humidity_2m_mean (%)`)
+
+"Adding weather variables to dataframe"
+ken_daily_orders <- ken_daily_orders %>% 
+  left_join(weather_data, by = c("datum_creatie" = "time"))
+
+"Visualization"
+ggplot(ken_daily_orders, aes(x = temperature, y = order_count)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "Order Count vs. Temperature")
+
+"Correlation matrix"
+cor(ken_daily_orders %>% select(order_count, temperature, humidity), use = "complete.obs")
+
+"Linear regression"
+model_basic <- lm(log_orders ~ day_of_week , data = ken_daily_orders)
+model_temperature <- lm(log_orders ~ day_of_week + temperature, data = ken_daily_orders)
+model_humidity <- lm(log_orders ~ day_of_week + humidity, data = ken_daily_orders)
+
+
+summary(model_temperature)
+summary(model_humidity)
+
+anova(model_basic, model_temperature)
+anova(model_basic, model_humidity)
+```
+
+```{r}
+weekly_data <- ken_daily_orders %>%
+  mutate(log_order_count = log(order_count)) %>%
+  group_by(week) %>%
+  summarise(
+    temperature = mean(temperature, na.rm = TRUE),
+    humidity = mean(humidity, na.rm = TRUE),
+    log_order_count = mean(log_order_count, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  filter(week != min(week), week != max(week))  # Remove first/last week
+
+# Reshape for plotting
+weekly_long <- weekly_data %>%
+  pivot_longer(cols = c(log_order_count, temperature, humidity),
+               names_to = "Variable",
+               values_to = "Value")
+
+# Plot
+ggplot(weekly_long, aes(x = week, y = Value)) +
+  geom_line(color = "steelblue", size = 1) +
+  facet_wrap(~ Variable, ncol = 1, scales = "free_y") +
+  labs(
+    title = "Weekly average log(order count), temperature, and humidity",
+    x = "Week",
+    y = "Value"
+  ) +
+  theme_minimal()
+
+
+ggplot(weekly_data, aes(x = temperature, y = log_order_count)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  theme_minimal() +
+  labs(title = "log(order count) vs Temperature")
+
+
+test <- lm(log_order_count ~ day_of_week + temperature + humidity, data = ken_daily_orders)
+summary(test)
+```
+
+# Time Series Analysis
+
+## Daily level
+
+```{r}
+"Visualizing daily orders over time"
+# Decomposition
+decomposed <- decompose(ken_ts)
+plot(decomposed)
+
+# Checking for stationarity
+adf.test(ken_daily_orders$order_count)
+
+# Plot ACF
+acf(ken_daily_orders$order_count, lag.max = 30)
+# Plot PACF
+pacf(ken_daily_orders$order_count, lag.max = 30)
+
+```
+
+## Weekly level
+
+```{r}
+# Aggregate to weekly level
+ken_weekly_orders <- ken_daily_orders %>%
+  mutate(week = floor_date(datum_creatie, unit = "week")) %>%
+  group_by(week) %>%
+  summarise(weekly_order_count = sum(order_count), .groups = 'drop') %>%
+  arrange(week) %>%
+  ungroup() %>%
+  filter(week < max(week) & week > min(week)) # Exclude last and first weeks, as it is complete
+
+# Create ts object
+ken_weekly_ts <- ts(
+  ken_weekly_orders$weekly_order_count,
+  start = c(year(min(ken_weekly_orders$week)), week(min(ken_weekly_orders$week))),
+  frequency = 52)
+
+# Get decomposition graph
+stl_decomp <- stl(ken_weekly_ts, s.window = "periodic")
+plot(stl_decomp)
+
+# Extract the components
+components <- stl_decomp$time.series
+
+# Get standard deviation for each component
+apply(components, 2, sd)
+
+# Or get the proportion of variance explained
+var_components <- apply(components, 2, var)
+prop_var <- var_components / sum(var_components)
+prop_var
+
+# Downloading and saving image to /figures folder
+png(
+  filename = here("figures", "stl_order_weekly_data_decomposition.png"),
+  width = 1000,
+  height = 800
+)
+plot(stl_decomp)
+dev.off()
+
+# Plot ACF
+acf(ken_weekly_orders$weekly_order_count, lag.max = 30)
+# Plot PACF
+pacf(ken_weekly_orders$weekly_order_count, lag.max = 30)
+```
+
+## Structural Break Analysis
+
+There seems to have been a astructural break around 2023. We test this with the Chow Test. This test consideras a linear model split into samples at a predeterined break point.
+
+In The Quandt Likelihood Ratio test, it tries to determine the breakpoint itself by copmuting the Chow test at all possible break points. The largest Chow test statistic is then chosen.
+
+```{r}
+"Finding break point, only using time trend"
+# Create time variable
+ken_daily_orders$time <- 1:nrow(ken_daily_orders)
+
+# Fit full model
+full_model <- lm(order_count ~ time, data = ken_daily_orders)
+
+# Find the breaking points
+breaks_model <- breakpoints(order_count ~ time, data = ken_daily_orders)
+summary(breaks_model)
+ken_daily_orders$datum_creatie[c(737)] # Date = 2024-01-07
+
+# Perform Chow test with found breaking point 
+sctest(full_model, type = "Chow", point = 737) 
+# --> p-val = 0.4468, not significant
+```
+
+The found structural break, was not significant. This is probably because seasonalities were not take into account. now to take seasonality, which are: day of week, public holidays and school holidays into account:
+
+```{r}
+"Finding break point, also using other variables"
+# Where are breakpoints
+breaks_model <- breakpoints(order_count ~ time + day_of_week + is_PublicHoliday + is_SchoolHoliday, data = ken_daily_orders)
+
+# Summary gives you the break date(s)
+summary(breaks_model)
+ken_daily_orders$datum_creatie[c(463)] # Date = 2023-04-08
+
+full_model2 <- lm(order_count ~ time + day_of_week + is_PublicHoliday + is_SchoolHoliday,
+                 data = ken_daily_orders)
+
+# Perform Chow test with found breaking point 
+sctest(full_model2, type = "Chow", point = 463) 
+# --> p-val = 4.308e-13, very significant
+```
+
+```{r adding break variables}
+break_point <- 463
+
+ken_daily_orders <- ken_daily_orders %>%
+  mutate(
+    day_index = row_number(),
+    trend_pre_break = if_else(day_index <= break_point, day_index, 0),
+    trend_post_break = if_else(day_index > break_point, day_index - break_point, 0)
+  )
+```
+
+# Dataset for analysis
+
+```{r breakpoint}
+#write.csv(ken_daily_orders, file = here::here("Data", "ken_daily_orders_variables.csv"), row.names = FALSE)
+```

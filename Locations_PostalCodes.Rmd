@@ -1,0 +1,83 @@
+## Libraries
+
+```{r}
+library(here)
+library(dplyr)
+library(readr)
+
+```
+
+## Importing Data
+
+```{r}
+# Made from Location_availability 
+blood_collection_coordinates <- read_xlsx(here("Data", "Geographic_data", "blood_collection_coordinates.xlsx"))
+
+# Glims data
+ken_order_data <- read_csv(here::here("Data", "ken_order_data_clean.csv"))
+
+Glims_locations <- ken_order_data %>%
+  dplyr::select(afname_locatie) %>%
+  distinct()  
+
+write_xlsx(Glims_locations, here("Data", "Geographic_data", "Glims_locations.xlsx"))
+write_csv(Glims_locations, here("Data", "Geographic_data", "Glims_locations.csv"))
+```
+
+Now for easy, we match them in an excel.
+
+```{r}
+blood_collection_coordinates_glims <- read_xlsx(here("Data", "Geographic_data", "blood_collection_coordinates_with_glims.xlsx"))
+```
+
+## Relevant PCS
+
+```{r}
+ken_order_data <- read_csv(here::here("Data", "ken_order_data_clean.csv"))
+num_orders_per_pc <- read_csv(here("Data", "count_num_orders_per_postcode.csv"))
+
+kennemerland_postalcodes <- num_orders_per_pc %>% 
+  distinct(PC4)
+
+georef <- read_xlsx(here("Data", "georef-netherlands-postcode-pc4.xlsx"))
+
+```
+
+```{r}
+"Geojson file"
+library(sf)
+all_geopoint_data <- st_read(here("Data", "Geographic_data", "georef-netherlands-postcode-pc4.geojson"))
+
+all_geopoint_data <- all_geopoint_data %>%
+  mutate(pc4_code = as.character(pc4_code))  # replace with the correct column name
+
+# Filter to only Kennermerland postcodes
+ken_geopoint_data <- all_geopoint_data %>%
+  filter(pc4_code %in% kennemerland_postalcodes$PC4)
+```
+
+## Blood Collection Points Within the Kennemerland Region
+
+```{r}
+# Convert blood_collection_coordinates to an sf object
+blood_locations_sf <- st_as_sf(
+  blood_collection_coordinates_glims,
+  coords = c("longitude", "latitude"),
+  crs = 4326  # WGS84, same as ken_geopoint_data
+)
+
+# Spatial join
+locations_in_ken <- st_join(blood_locations_sf, ken_geopoint_data, join = st_within)
+
+# Getting dataframe with all blood collectin locations within Kennemerland
+locations_in_ken <- locations_in_ken %>%
+  filter(!is.na(pc4_code))
+
+# There are 24 locations within the Kennemerland region
+length(locations_in_ken$Name)
+
+locations_in_ken_names <- locations_in_ken %>% 
+  select(Name, Glims_naam)
+
+write_csv(locations_in_ken_names, here("Data", "Geographic_data", "locations_in_ken_names.xlsx"))
+```

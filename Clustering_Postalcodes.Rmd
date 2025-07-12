@@ -1,0 +1,275 @@
+## Libraries
+
+```{r}
+library(readxl)
+library(here)
+library(dplyr)
+library(factoextra)
+```
+
+## Loading Data
+
+```{r}
+ken_order_data <- read_csv(here::here("Data", "ken_order_data_clean.csv"))
+locations_in_ken_names <- read_csv(here("Data", "Geographic_data", "locations_in_ken_names.csv"))
+
+ken_order_data_recent <- ken_order_data %>%
+  filter(!is.na(afname_locatie)) %>% # only keep data where location is given
+  filter(datum_creatie >= as.Date("2024-01-01")) %>% # only allow data from 2024 and further
+  mutate(afname_locatie = if_else(
+    afname_locatie == "K_N.Kern - Kennemer, De Nieuwe Kern",
+    "GC De Nieuwe Kern",
+    afname_locatie
+  ))
+
+```
+
+## Merge blood locations and postal codes
+
+```{r}
+# Aggregating data on postcode patient and afname_locatie and get count
+aggregated_ken_order_data <- ken_order_data_recent %>%
+  group_by(postcode_patient, afname_locatie) %>%
+  summarise(order_count = n(), .groups = "drop")
+
+# Clean afname_locatie
+aggregated_ken_order_data <- aggregated_ken_order_data %>%
+  mutate(afname_locatie_clean = str_to_lower(str_replace_all(afname_locatie, "\\s+", "")))
+
+# Clean Glims_naam
+locations_in_ken_names <- locations_in_ken_names %>%
+  mutate(Glims_naam_clean = str_to_lower(str_replace_all(Glims_naam, "\\s+", "")))
+
+# Match cleaned values
+aggregated_ken_order_data <- aggregated_ken_order_data %>%
+  mutate(is_in_ken_locations = if_else(afname_locatie_clean %in% locations_in_ken_names$Glims_naam_clean, 1, 0))
+
+# If in 
+aggregated_ken_order_data <- aggregated_ken_order_data %>%
+  mutate(afname_locatie_clean2 = if_else(is_in_ken_locations == 1, afname_locatie_clean, "other"))
+  
+```
+
+## Preparation for Clustering
+
+```{r}
+# Calcualte the share of orders per pair
+location_shares <- aggregated_ken_order_data %>%
+  group_by(postcode_patient) %>%
+  mutate(total_orders = sum(order_count)) %>%  # total orders per patient postcode
+  ungroup() %>%
+  group_by(postcode_patient, afname_locatie_clean2) %>%
+  summarise(location_orders = sum(order_count),  # total to each location
+            total_orders = first(total_orders),  # total per postcode
+            .groups = "drop") %>%
+  mutate(share = location_orders / total_orders)  # calculate share
+
+# Convert to a pivot table
+location_shares_wide <- location_shares %>%
+  select(postcode_patient, afname_locatie_clean2, share) %>%
+  pivot_wider(names_from = afname_locatie_clean2, values_from = share, values_fill = 0)
+
+# Prepare matrix for clustering
+# Save row labels
+postcodes <- location_shares_wide$postcode_patient
+
+# Create matrix for clustering
+clustering_matrix <- location_shares_wide %>%
+  select(-postcode_patient) %>%
+  as.matrix()
+```
+
+## K-means Clustering
+
+```{r}
+"Deciding on K"
+# Elbow plot
+elbow_plot <- fviz_nbclust(clustering_matrix, kmeans, method = "wss", k.max = 20) +
+  labs(title = "Elbow Method for Optimal k")
+
+ggsave(
+  filename = here("results", "clustering", "elbow_method_kmeans.png"),
+  plot = elbow_plot,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+
+# Silhouette plot
+silhouette_plot <- fviz_nbclust(clustering_matrix, kmeans, method = "silhouette", k.max = 20) +
+  labs(title = "Silhouette Method for Optimal k")
+
+ggsave(
+  filename = here("results", "clustering", "silhouette_method_kmeans.png"),
+  plot = silhouette_plot,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+```
+
+![](http://127.0.0.1:11407/chunk_output/B74CA4B8a51ef15a/8DFE7B38/c4iua8w3pfn5n/000034.png)
+
+```{r}
+set.seed(123)  # for reproducibility
+
+# Perform k-mean clustering
+kmeans_result <- kmeans(clustering_matrix, centers = 9, nstart = 50) # choose number of clusters: 9, number of starts is 50
+location_clusters <- data.frame(
+  postcode_patient = postcodes,
+  cluster = kmeans_result$cluster
+)
+
+# Overview of clusters and postal codes
+location_clusters <- data.frame(
+  postcode_patient = postcodes,        # stored earlier from the wide matrix
+  cluster = kmeans_result$cluster      # cluster assignments
+)
+# See distribution num postal codes per cluster
+table(location_clusters$cluster)
+
+# Save results for figures
+write_xlsx(location_clusters, here("figures", "maps", "location_clusters.xlsx"))
+
+# Add clusters to dataset
+aggregated_ken_order_data <- aggregated_ken_order_data %>%
+  left_join(location_clusters, by = "postcode_patient")
+```
+
+## Location-Postal Code proportion per Cluster
+
+```{r}
+cluster_aggregated <- aggregated_ken_order_data %>%
+  filter(!is.na(afname_locatie)) %>%  # optional: remove missing locations
+  group_by(cluster, afname_locatie_clean2) %>%
+  summarise(total_orders = sum(order_count, na.rm = TRUE), .groups = "drop")
+
+# Calculate the proportions per cluster
+cluster_location_shares <- aggregated_ken_order_data %>%
+  filter(!is.na(afname_locatie)) %>%
+  group_by(cluster, afname_locatie_clean2) %>%
+  summarise(total_orders = sum(order_count, na.rm = TRUE), .groups = "drop") %>%
+  group_by(cluster) %>%
+  mutate(share = total_orders / sum(total_orders)) %>%
+  arrange(cluster, desc(share))
+```
+
+## Calculate historic order proportion per Cluster
+
+```{r}
+cluster_share_over_locations <- aggregated_ken_order_data %>%
+  filter(!is.na(cluster)) %>%
+  group_by(cluster) %>%
+  summarise(
+    total_orders = sum(order_count, na.rm = TRUE),
+    n = n_distinct(postcode_patient),  # number of unique postal codes
+    .groups = "drop"
+  ) %>%
+  mutate(
+    overall_share = round(total_orders / sum(total_orders), 3)
+  ) %>%
+  arrange(cluster)
+
+write_csv(cluster_share_over_locations, here("results", "clustering", "cluster_share_over_locations.csv"))
+
+```
+
+Check whether proportion is somewhat stable over time: check whether monthly shares stays constant, yes it does!
+
+```{r}
+ken_order_data_with_clusters <- ken_order_data_recent %>%
+  left_join(location_clusters, by = "postcode_patient") %>%
+  mutate(month = floor_date(datum_creatie, unit = "month"))
+
+# Remove last ( incomplete) month
+max_month <- max(ken_order_data_with_clusters$month, na.rm = TRUE)
+
+# Calculate share
+monthly_cluster_share <- ken_order_data_with_clusters %>%
+  filter(!is.na(cluster), month < max_month) %>%
+  group_by(month, cluster) %>%
+  summarise(cluster_orders = n(), .groups = "drop") %>%
+  group_by(month) %>%
+  mutate(
+    total_orders = sum(cluster_orders),
+    share = cluster_orders / total_orders
+  ) %>%
+  ungroup()
+
+# Visualize
+p <- ggplot(monthly_cluster_share, aes(x = month, y = share, color = factor(cluster))) +
+  geom_line() +
+  geom_smooth(se = FALSE, method = "loess", span = 0.3) +
+  labs(title = "Monthly Demand Share per Cluster",
+       x = "Month", y = "Proportion of Total Weekly Demand", color = "Cluster") +
+  theme_minimal()
+
+ggsave(filename = here::here("results", "clustering", "monthly_cluster_share.png"),
+       plot = p,
+       width = 8,
+       height = 5,
+       dpi = 300)
+```
+
+
+
+```{r}
+library(lubridate)
+library(dplyr)
+library(ggplot2)
+
+# Add cluster info and extract day
+ken_order_data_with_clusters <- ken_order_data_recent %>%
+  left_join(location_clusters, by = "postcode_patient") %>%
+  mutate(date = as.Date(datum_creatie))
+
+# Identify the last *complete* date
+max_date <- max(ken_order_data_with_clusters$date, na.rm = TRUE)
+last_complete_month <- floor_date(max_date, unit = "month") %m-% months(1) # skip current incomplete month
+start_date <- last_complete_month %m-% months(1) # two full months before that
+
+# Filter and calculate daily shares
+daily_cluster_share <- ken_order_data_with_clusters %>%
+  filter(!is.na(cluster), date >= start_date, date < last_complete_month %m+% months(1)) %>%
+  group_by(date, cluster) %>%
+  summarise(cluster_orders = n(), .groups = "drop") %>%
+  group_by(date) %>%
+  mutate(
+    total_orders = sum(cluster_orders),
+    share = cluster_orders / total_orders
+  ) %>%
+  ungroup()
+
+# Plot daily share
+p <- ggplot(daily_cluster_share, aes(x = date, y = share, color = factor(cluster))) +
+  geom_smooth(se = FALSE, method = "loess", span = 0.3) +
+  labs(title = "Daily Demand Share per Cluster (Last 2 Full Months)",
+       x = "Date", y = "Proportion of Total Daily Demand", color = "Cluster") +
+  theme_minimal()
+
+# Save to file
+ggsave(filename = here::here("results", "clustering", "daily_cluster_share.png"),
+       plot = p,
+       width = 10,
+       height = 6,
+       dpi = 300)
+
+```
+
+
+
+## Calculate the Forecasted Number of Orders/day per Cluster
+
+```{r}
+daily_forecasted_orders <- read_csv(here::here("results", "final_forecast.csv"))
+
+cluster_daily_forecast <- daily_forecasted_orders %>%
+  crossing(cluster_overall_share) %>%
+  mutate(
+    cluster_predicted_orders = round(predicted_order_count * overall_share)
+  ) %>%
+  select(date, cluster, cluster_predicted_orders)
+
+write_csv(cluster_daily_forecast, here("Data", "Simulation", "cluster_daily_forecast.csv"))
+
+```

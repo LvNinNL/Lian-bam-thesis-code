@@ -1,0 +1,135 @@
+We run the first part of data of 1. Data prep for simulation
+
+```{r}
+"Visualizing"
+# Seeing open, cancelled and completed orders in perc:
+percentage_data <- kennemerland_data_adjusted %>%
+  mutate(
+    month = floor_date(datum_creatie, "month"),
+    status = case_when(
+      ord_Status == 6 ~ "Cancellations",
+      ord_Status %in% c(1, 2) ~ "Open Orders",
+      ord_Status %in% c(3, 4) ~ "Completed",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  group_by(month) %>%
+  mutate(total_orders = n()) %>%                 
+  filter(!is.na(status)) %>%
+  group_by(month, status, total_orders) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  mutate(percentage = count / total_orders * 100)
+
+ggplot(percentage_data, aes(x = month, y = percentage, color = status)) +
+  geom_line(size = 1.2) +
+  geom_point() +
+  labs(
+    title = "Percentage of Total Orders by Status Over Time",
+    x = "Month",
+    y = "Percentage of All Orders",
+    color = "Order Status"
+  ) +
+  theme_minimal() +
+  scale_color_manual(values = c(
+    "Cancellations" = "firebrick",
+    "Open Orders" = "steelblue",
+    "Completed" = "darkgreen"
+  ))+
+  scale_y_continuous(
+    limits = c(0, 100),
+    breaks = seq(0, 100, 5),     # more precise, every 5%
+    labels = function(x) paste0(x, "%")
+  )
+
+# Open orders, older than 1,25 years old, put to status cancelled: orders made before 2024, will not be realised. 
+kennemerland_data_adjusted <- kennemerland_data
+
+
+kennemerland_data_adjusted <- kennemerland_data_adjusted %>% 
+  mutate(
+    ord_Status = case_when(
+      ord_Status %in% c(1, 2) & datum_creatie < as.Date("2024-01-01") ~ 6,
+      TRUE ~ ord_Status
+    )
+  )
+
+sum(kennemerland_data_adjusted$ord_Status %in% c(1,2))
+sum(kennemerland_data$ord_Status %in% c(1,2))
+"first, there were 198180 open orders, now this is reduced to 193672"
+
+
+# See what percentages are per month
+order_summary_df <- kennemerland_data_adjusted %>%
+  group_by(year_month_creatie) %>%
+  summarise(
+    total_orders = n(),
+    perc_cancelled = mean(ord_Status == 6) * 100,
+    perc_complete = mean(ord_Status %in% c(3, 4)) * 100,
+    perc_open     = mean(ord_Status %in% c(1, 2)) * 100
+  ) %>%
+  ungroup()
+
+# Calculate when average
+avg_perc_complete <- order_summary_df %>%
+  filter(year_month_creatie < "2024-01") %>%
+  summarise(avg_perc_complete = mean(perc_complete, na.rm = TRUE)) %>% 
+  pull(avg_perc_complete)
+
+avg_perc_cancel <- order_summary_df %>%
+  filter(year_month_creatie < "2024-01") %>%
+  summarise(avg_perc_cancel = mean(perc_cancelled, na.rm = TRUE)) %>% 
+  pull(avg_perc_cancel)
+
+order_summary_df <- kennemerland_data_adjusted %>%
+  group_by(year_month_creatie) %>%
+  summarise(
+    total_orders = n(),
+    perc_cancelled = mean(ord_Status == 6) * 100,
+    perc_complete = mean(ord_Status %in% c(3, 4)) * 100,
+    perc_open     = mean(ord_Status %in% c(1, 2)) * 100,
+    
+    # calculate difference between average and current % completed or cancelled
+    diff_perc_compl = avg_perc_complete - perc_complete,
+    diff_perc_canc = avg_perc_cancel - perc_cancelled,
+    
+    # calculate propensity of current open orders taht will be completed or will be cancelled
+    prop_open_tb_compl = diff_perc_compl / perc_open,
+    prop_open_tb_canc = diff_perc_canc / perc_open
+  ) %>%
+  ungroup()
+
+```
+
+```{r}
+# Now that we know what percentage of open orders will be cancelled, we add this, we remove these data from the open_orders dataset. 
+ken_open_orders_adj <- kennemerland_data_adjusted %>% 
+  filter(ord_Status %in% c(1,2)) %>% 
+  select(datum_creatie, postcode_patient, Cito, year_month_creatie)
+
+# Merge with data prop_open_tb_completed
+ken_open_orders_adj <- ken_open_orders_adj %>% 
+  left_join(order_summary_df %>% select(year_month_creatie, prop_open_tb_canc), by = "year_month_creatie")
+
+# set.seed
+set.seed(123)  # for reproducibility
+
+ken_open_orders_adj <- ken_open_orders_adj %>%
+  group_by(year_month_creatie) %>%
+  mutate(
+    cancelled = {
+      n_orders <- n()
+      n_cancel <- round(prop_open_tb_canc[1] * n_orders)
+      cancelled_flags <- c(rep(1, n_cancel), rep(0, n_orders - n_cancel))
+      sample(cancelled_flags)
+    }
+  ) %>%
+  ungroup() 
+
+# counting how many will be cancelled and which one will still be processed
+table(ken_open_orders_adj$cancelled)
+
+# only sect
+open_orders_tb_compl <- ken_open_orders_adj %>% 
+  filter(cancelled == 0) %>% 
+  select(-cancelled)
+```
